@@ -228,21 +228,24 @@ apply_iptables_rules() {
 # --- СПИСОК ПРАВИЛ ---
 list_active_rules() {
     echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
-    echo -e "${MAGENTA}ПОРТ (ВХОД)\tПРОТОКОЛ\tЦЕЛЬ (IP:ВЫХОД)${NC}"
+
+    SERVER_IP=$(curl -s ifconfig.me 2>/dev/null)
+    [ -z "$SERVER_IP" ] && SERVER_IP=$(hostname -I | awk '{print $1}')
+
+    echo -e "${MAGENTA}Сервер каскада:${NC} ${GREEN}${SERVER_IP}${NC}"
+    echo ""
+    echo -e "${MAGENTA}ВХОД (этот VPS) -> ВЫХОД (целевой сервер)${NC}"
+    echo ""
+
     iptables -t nat -S PREROUTING | grep "DNAT" | while read -r line ; do
         l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        if [[ -n "$l_port" ]]; then echo -e "$l_port\t\t$l_proto\t\t$l_dest"; fi
+
+        if [[ -n "$l_port" ]]; then
+            echo -e "${CYAN}${SERVER_IP}:${l_port}${NC} (${YELLOW}${l_proto}${NC}) -> ${GREEN}${l_dest}${NC}"
+        fi
     done
-    echo ""
-    
-    echo -e "${GREEN}💰 Задонатить каналу и автору:${NC}"
-    if command -v qrencode &> /dev/null; then
-        qrencode -t ANSIUTF8 "https://pay.cloudtips.ru/p/4a618628"
-    else
-        echo "https://pay.cloudtips.ru/p/4a618628"
-    fi
     echo ""
 
     read -p "Нажмите Enter..."
