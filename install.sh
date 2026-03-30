@@ -3,7 +3,7 @@
 clear
 echo "=================================="
 echo "     COMP_MANIYA KASKAD"
-echo "  Telegram: https://t.me/computerchik"
+echo " Telegram: https://t.me/computerchik"
 echo "=================================="
 
 apt update -y
