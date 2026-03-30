@@ -80,10 +80,11 @@ compmaniya
 | `compmaniya` | **60% скидка** на первый месяц аренды |
 | `compmaniya30` | Буст **-30%** (-30% при оплате за 1 мес) |
 | `compmaniya20` | Буст **-20%**  (-20% при оплате за 3 мес) |
+| `compmaniya20` | Буст **-15%**  (-15% при оплате за 6 мес) |
 | `compmaniya5` | Буст **-5%** (-5% при оплате за 12 мес) |
 
 **🇧🇾 Локация: Беларусь**
-* **Ссылка для регистрации:** [https://vk.cc/cUxAhj](https://vk.cc/cUxAhj)
+* **Ссылка для регистрации:** VPS серверы в России - https://adminvps.ru/vps/vps_russia.php?aff=30310
 
 | Промокод | Описание бонуса |
 | :--- | :--- |
@@ -93,9 +94,9 @@ compmaniya
 
 ## 🔗 Полезные ссылки
 
-* **YouTube канал:** [https://www.youtube.com/@antenkaru](https://www.youtube.com/@antenkaru)
-* **Инструкции (Boosty):** [https://boosty.to/anten-ka](https://boosty.to/anten-ka)
-* **Все ссылки (Taplink):** [https://antenka.taplink.ws](https://antenka.taplink.ws)
-* **Поддержка (Tribute):** [https://web.tribute.tg/p/cJu](https://web.tribute.tg/p/cJu)
+* **YouTube канал:** [https://www.youtube.com/@comp_maniya](https://www.youtube.com/@comp_maniya)
+* **Телеграмм (Telegram):** [https://t.me/computerchik](https://t.me/computerchik)
+* **Вконтакте (Vk):** [https://vk.com/club145539285](https://vk.com/club145539285)
 
-> 💰 **Поддержать автора донатом:** [CloudTips (pay.cloudtips.ru)](https://pay.cloudtips.ru/p/7410814f)
+
+> 💰 **Поддержать автора донатом:** [CloudTips (pay.cloudtips.ru)](https://pay.cloudtips.ru/p/4a618628)
