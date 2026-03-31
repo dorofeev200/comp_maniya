@@ -434,6 +434,71 @@ uninstall_script() {
     exit 0
 }
 
+# --- МОНИТОРИНГ VPS ---
+system_status() {
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║         МОНИТОРИНГ VPS               ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
+    echo ""
+
+    echo -e "${YELLOW}CPU LOAD:${NC}"
+    uptime
+    echo ""
+
+    echo -e "${YELLOW}RAM:${NC}"
+    free -h
+    echo ""
+
+    echo -e "${YELLOW}DISK:${NC}"
+    df -h /
+    echo ""
+
+    echo -e "${YELLOW}NETWORK:${NC}"
+    ss -s
+    echo ""
+
+    read -p "Нажмите Enter..."
+}
+
+# --- ТРАФИК ПО ПОРТАМ ---
+port_traffic_stats() {
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║        ТРАФИК ПО ПОРТАМ              ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
+    echo ""
+
+    echo -e "${YELLOW}INPUT/FORWARD:${NC}"
+    iptables -L -v -n
+    echo ""
+
+    echo -e "${YELLOW}NAT:${NC}"
+    iptables -t nat -L -v -n
+    echo ""
+
+    read -p "Нажмите Enter..."
+}
+
+# --- ОГРАНИЧЕНИЕ ПО IP ---
+lock_port_to_ip() {
+    clear
+    echo -e "${CYAN}--- Ограничение доступа по IP ---${NC}"
+
+    read -p "Введите IP клиента: " CLIENT_IP
+    read -p "Введите порт: " PORT
+    read -p "Протокол (tcp/udp): " PROTO
+
+    iptables -I INPUT -p "$PROTO" -s "$CLIENT_IP" --dport "$PORT" -j ACCEPT
+    iptables -A INPUT -p "$PROTO" --dport "$PORT" -j DROP
+
+    netfilter-persistent save > /dev/null
+
+    echo -e "${GREEN}[OK] Доступ разрешён только для ${CLIENT_IP}${NC}"
+
+    read -p "Нажмите Enter..."
+}
+
 # --- МЕНЮ ---
 show_menu() {
     while true; do
@@ -462,6 +527,9 @@ show_menu() {
         echo -e "11) Создать backup"
         echo -e "12) Восстановить backup"
         echo -e "13) ${RED}Удалить скрипт полностью${NC}"
+        echo -e "14) Мониторинг VPS"
+        echo -e "15) Трафик по портам"
+        echo -e "16) Ограничить доступ по IP"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
 
@@ -481,6 +549,9 @@ show_menu() {
             11) backup_rules ;;
             12) restore_rules ;;
             13) uninstall_script ;;
+            14) system_status ;;
+            15) port_traffic_stats ;;
+            16) lock_port_to_ip ;;
             0) exit 0 ;;
             *) ;;
         esac
