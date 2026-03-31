@@ -311,6 +311,127 @@ flush_rules() {
     read -p "Нажмите Enter..."
 }
 
+# --- ПРОВЕРКА СОЕДИНЕНИЯ ---
+check_connection() {
+    clear
+    echo -e "${CYAN}--- Проверка соединения ---${NC}"
+
+    while true; do
+        read -p "Введите IP для проверки: " TEST_IP
+        [[ -n "$TEST_IP" ]] && break
+    done
+
+    while true; do
+        read -p "Введите порт: " TEST_PORT
+        [[ "$TEST_PORT" =~ ^[0-9]+$ ]] && [ "$TEST_PORT" -le 65535 ] && break
+        echo -e "${RED}Ошибка: введите корректный порт!${NC}"
+    done
+
+    while true; do
+        read -p "Протокол (tcp/udp): " TEST_PROTO
+        [[ "$TEST_PROTO" == "tcp" || "$TEST_PROTO" == "udp" ]] && break
+        echo -e "${RED}Ошибка: только tcp или udp!${NC}"
+    done
+
+    echo ""
+    echo -e "${YELLOW}[*] Проверка ping...${NC}"
+    ping -c 2 "$TEST_IP"
+
+    echo ""
+    echo -e "${YELLOW}[*] Проверка порта...${NC}"
+
+    if ! command -v nc >/dev/null 2>&1; then
+        apt-get update -y >/dev/null
+        apt-get install -y netcat-openbsd >/dev/null
+    fi
+
+    if [[ "$TEST_PROTO" == "tcp" ]]; then
+        nc -zv "$TEST_IP" "$TEST_PORT"
+    else
+        nc -zvu "$TEST_IP" "$TEST_PORT"
+    fi
+
+    read -p "Нажмите Enter..."
+}
+
+# --- BACKUP ---
+backup_rules() {
+    clear
+    echo -e "${CYAN}--- Создание backup ---${NC}"
+
+    iptables-save > /root/compmaniya-backup.rules
+
+    echo -e "${GREEN}[OK] Backup сохранён:${NC}"
+    echo "/root/compmaniya-backup.rules"
+
+    read -p "Нажмите Enter..."
+}
+
+# --- RESTORE ---
+restore_rules() {
+    clear
+    echo -e "${CYAN}--- Восстановление backup ---${NC}"
+
+    if [[ ! -f /root/compmaniya-backup.rules ]]; then
+        echo -e "${RED}[ERROR] Backup не найден!${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    iptables-restore < /root/compmaniya-backup.rules
+    netfilter-persistent save > /dev/null
+
+    echo -e "${GREEN}[OK] Правила восстановлены.${NC}"
+
+    read -p "Нажмите Enter..."
+}
+
+# --- ПОЛНОЕ УДАЛЕНИЕ ---
+uninstall_script() {
+    clear
+    echo -e "${RED}╔══════════════════════════════════════╗${NC}"
+    echo -e "${RED}║      ПОЛНОЕ УДАЛЕНИЕ СКРИПТА         ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════╝${NC}"
+    echo ""
+
+    echo "Будет удалено:"
+    echo "- все правила iptables"
+    echo "- backup файл"
+    echo "- launcher команда compmaniya"
+    echo ""
+
+    read -p "Введите YES для подтверждения: " confirm
+
+    if [[ "$confirm" != "YES" ]]; then
+        echo -e "${YELLOW}Удаление отменено.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    echo -e "${YELLOW}[*] Очистка iptables...${NC}"
+
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+    iptables -t nat -F
+    iptables -t mangle -F
+    iptables -F
+    iptables -X
+
+    netfilter-persistent save > /dev/null
+
+    echo -e "${YELLOW}[*] Удаление файлов...${NC}"
+
+    rm -f /usr/local/bin/compmaniya
+    rm -f /root/compmaniya-backup.rules
+
+    echo ""
+    echo -e "${GREEN}[SUCCESS] Скрипт полностью удалён.${NC}"
+    echo -e "${GREEN}[SUCCESS] Перезапустите терминал.${NC}"
+
+    exit 0
+}
+
 # --- МЕНЮ ---
 show_menu() {
     while true; do
@@ -329,14 +450,19 @@ show_menu() {
         echo -e "1) Настроить ${CYAN}AmneziaWG / WireGuard${NC} (UDP)"
         echo -e "2) Настроить ${CYAN}VLESS / XRay${NC} (TCP)"
         echo -e "3) Настроить ${CYAN}TProxy / MTProto${NC} (TCP)"
-        echo -e "4) 🛠 Создать ${YELLOW}Кастомное правило${NC} (Разные порты, SSH, RDP...)"
+        echo -e "4) 🛠 Создать ${YELLOW}Кастомное правило${NC}"
         echo -e "5) Посмотреть активные правила"
         echo -e "6) ${RED}Удалить одно правило${NC}"
         echo -e "7) ${RED}Сбросить ВСЕ настройки${NC}"
         echo -e "8) ${YELLOW}Показать PROMO${NC}"
-        echo -e "9) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
+        echo -e "9) ${MAGENTA}📚 ИНСТРУКЦИЯ${NC}"
+        echo -e "10) Проверить соединение"
+        echo -e "11) Создать backup"
+        echo -e "12) Восстановить backup"
+        echo -e "13) ${RED}Удалить скрипт полностью${NC}"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
+
         read -p "Ваш выбор: " choice
 
         case $choice in
@@ -349,6 +475,10 @@ show_menu() {
             7) flush_rules ;;
             8) show_promo ;;
             9) show_instructions ;;
+            10) check_connection ;;
+            11) backup_rules ;;
+            12) restore_rules ;;
+            13) uninstall_script ;;
             0) exit 0 ;;
             *) ;;
         esac
