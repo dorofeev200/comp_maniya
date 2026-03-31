@@ -511,6 +511,20 @@ lock_port_to_ip() {
     read -p "Нажмите Enter..."
 }
 
+# --- LIVE ПОДКЛЮЧЕНИЯ ---
+live_connections() {
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║          LIVE ПОДКЛЮЧЕНИЯ            ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
+    echo ""
+
+    ss -tunp | head -30
+
+    echo ""
+    read -p "Нажмите Enter..."
+}
+
 # --- МЕНЮ ---
 show_menu() {
     while true; do
@@ -542,6 +556,7 @@ show_menu() {
         echo -e "14) Мониторинг VPS"
         echo -e "15) Трафик по портам"
         echo -e "16) Ограничить доступ по IP"
+        echo -e "17) Live подключения"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
 
@@ -564,6 +579,7 @@ show_menu() {
             14) system_status ;;
             15) port_traffic_stats ;;
             16) lock_port_to_ip ;;
+            17) live_connections ;;
             0) exit 0 ;;
             *) ;;
         esac
