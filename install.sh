@@ -402,10 +402,12 @@ uninstall_script() {
 
     read -p "Введите YES для подтверждения: " confirm
 
-    if [[ "$confirm" != "YES" ]]; then
-        echo -e "${YELLOW}Удаление отменено.${NC}"
-        read -p "Нажмите Enter..."
-        return
+    confirm=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$confirm" != "yes" && "$confirm" != "y" ]]; then
+    echo -e "${YELLOW}Удаление отменено.${NC}"
+    read -p "Нажмите Enter..."
+    return
     fi
 
     echo -e "${YELLOW}[*] Очистка iptables...${NC}"
