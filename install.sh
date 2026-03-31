@@ -461,22 +461,34 @@ system_status() {
     read -p "Нажмите Enter..."
 }
 
-# --- ТРАФИК ПО ПОРТАМ ---
+# --- КРАСИВЫЙ СЧЁТЧИК ТРАФИКА ---
 port_traffic_stats() {
     clear
-    echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║        ТРАФИК ПО ПОРТАМ              ║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║               ТРАФИК ПО ПРАВИЛАМ KASKAD                  ║${NC}"
+    echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    echo -e "${YELLOW}INPUT/FORWARD:${NC}"
-    iptables -L -v -n
-    echo ""
+    printf "%-8s %-8s %-22s %-12s %-12s\n" "PORT" "PROTO" "DESTINATION" "PACKETS" "TRAFFIC"
+    echo "---------------------------------------------------------------------"
 
-    echo -e "${YELLOW}NAT:${NC}"
-    iptables -t nat -L -v -n
-    echo ""
+    iptables -t nat -L PREROUTING -v -n | grep DNAT | while read -r line; do
+        PACKETS=$(echo "$line" | awk '{print $1}')
+        BYTES=$(echo "$line" | awk '{print $2}')
+        PROTO=$(echo "$line" | awk '{print $4}')
+        PORT=$(echo "$line" | grep -oP 'dpt:\K\d+')
+        DEST=$(echo "$line" | grep -oP 'to:\K[\d\.:]+')
 
+        if [[ -n "$PORT" ]]; then
+            TRAFFIC=$(numfmt --to=iec --suffix=B "$BYTES" 2>/dev/null)
+            [[ -z "$TRAFFIC" ]] && TRAFFIC="${BYTES}B"
+
+            printf "%-8s %-8s %-22s %-12s %-12s\n" \
+                "$PORT" "$PROTO" "$DEST" "$PACKETS" "$TRAFFIC"
+        fi
+    done
+
+    echo ""
     read -p "Нажмите Enter..."
 }
 
