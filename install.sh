@@ -92,6 +92,17 @@ validate_port() {
     return 1
 }
 
+get_ip_type() {
+    local ip=$1
+    if validate_ipv4 "$ip"; then
+        echo "ipv4"
+    elif validate_ipv6 "$ip"; then
+        echo "ipv6"
+    else
+        echo "invalid"
+    fi
+}
+
 # --- SSH ПОРТИРОВАНИЕ (3-УРОВНЕВАЯ ПРОВЕРКА) ---
 
 get_ssh_ports() {
@@ -468,20 +479,75 @@ show_help() {
 
 # --- КОНФИГУРИРОВАНИЕ ПРАВИЛ ---
 
-configure_rule() {
+configure_rule_auto_detect() {
     local PROTO=$1
     local NAME=$2
+    local MODE=$3
+    local attempts=3
+    local ip_type
 
     echo -e "\n${CYAN}--- Настройка $NAME ($PROTO) ---${NC}"
 
-    while true; do
+    while [[ $attempts -gt 0 ]]; do
         echo -e "Введите IP адрес назначения (целевой сервер):"
         read -p "> " TARGET_IP
-        if validate_ipv4 "$TARGET_IP"; then 
-            break
+
+        ip_type=$(get_ip_type "$TARGET_IP")
+
+        if [[ "$ip_type" == "invalid" ]]; then
+            ((attempts--))
+            if [[ $attempts -gt 0 ]]; then
+                echo -e "${RED}Ошибка: введите корректный IPv4 или IPv6 адрес! (осталось попыток: $attempts)${NC}"
+            else
+                echo -e "${RED}[ERROR] Максимум 3 попытки исчерпаны. Отмена.${NC}"
+                read -p "Нажмите Enter..."
+                return 1
+            fi
+            continue
         fi
-        echo -e "${RED}Ошибка: введите корректный IPv4 адрес!${NC}"
+
+        if [[ "$ip_type" == "ipv4" ]]; then
+            # IPv4: вызвать нужную функцию
+            if [[ "$MODE" == "different_ports" ]]; then
+                configure_rule_with_different_ports "$PROTO" "$NAME" "$TARGET_IP"
+            else
+                configure_rule "$PROTO" "$NAME" "$TARGET_IP"
+            fi
+            return $?
+        fi
+
+        if [[ "$ip_type" == "ipv6" ]]; then
+            # IPv6: показать сообщение и создать IPv4→IPv6 каскад
+            echo -e "${CYAN}[*] Обнаружен IPv6, создаю IPv4→IPv6 каскад...${NC}"
+            
+            if [[ "$MODE" == "different_ports" ]]; then
+                configure_ipv4_to_ipv6_rule "$PROTO" "true" "$TARGET_IP"
+            else
+                configure_ipv4_to_ipv6_rule "$PROTO" "false" "$TARGET_IP"
+            fi
+            return $?
+        fi
     done
+}
+
+configure_rule() {
+    local PROTO=$1
+    local NAME=$2
+    local TARGET_IP=$3
+
+    echo -e "\n${CYAN}--- Настройка $NAME ($PROTO) ---${NC}"
+    
+    # Если TARGET_IP не передана, спросить (для обратной совместимости)
+    if [[ -z "$TARGET_IP" ]]; then
+        while true; do
+            echo -e "Введите IP адрес назначения (целевой сервер):"
+            read -p "> " TARGET_IP
+            if validate_ipv4 "$TARGET_IP"; then 
+                break
+            fi
+            echo -e "${RED}Ошибка: введите корректный IPv4 адрес!${NC}"
+        done
+    fi
 
     while true; do
         echo -e "Введите Порт (одинаковый для входа и выхода):"
@@ -530,6 +596,71 @@ configure_rule() {
     fi
 
     apply_iptables_rules "$PROTO" "$PORT" "$PORT" "$TARGET_IP" "$NAME"
+}
+
+configure_rule_with_different_ports() {
+    local PROTO=$1
+    local NAME=$2
+    local TARGET_IP=$3
+
+    echo -e "\n${CYAN}--- Настройка $NAME ($PROTO) - разные порты ---${NC}"
+
+    while true; do
+        echo -e "Введите ${YELLOW}ВХОДЯЩИЙ Порт${NC} (на этом сервере):"
+        read -p "> " IN_PORT
+        if validate_port "$IN_PORT"; then 
+            break
+        fi
+        echo -e "${RED}Ошибка: порт должен быть от 1 до 65535!${NC}"
+    done
+
+    # Проверка конфликта с SSH
+    if check_ssh_port_conflict "$IN_PORT"; then
+        if [[ "$PROTO" == "tcp" ]]; then
+            echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Входящий порт $IN_PORT совпадает с SSH портом!${NC}"
+            echo -e "${RED}Это заблокирует ваш доступ к серверу.${NC}"
+            read -p "Нажмите Enter..."
+            return 1
+        fi
+    fi
+    
+    # Проверка занятости локального входящего порта
+    if ! check_port_available_local "$IN_PORT" "$PROTO"; then
+        echo -e "${RED}[ERROR] Входящий порт $IN_PORT/$PROTO уже используется!${NC}"
+        read -p "Нажмите Enter..."
+        return 1
+    fi
+
+    while true; do
+        echo -e "Введите ${YELLOW}ИСХОДЯЩИЙ Порт${NC} (на целевом сервере):"
+        read -p "> " OUT_PORT
+        if validate_port "$OUT_PORT"; then 
+            break
+        fi
+        echo -e "${RED}Ошибка: порт должен быть от 1 до 65535!${NC}"
+    done
+    
+    # Проверка доступности целевого порта
+    echo -e "${YELLOW}[*] Проверка доступности ${TARGET_IP}:${OUT_PORT}/${PROTO}...${NC}"
+    if [[ "$PROTO" == "tcp" ]]; then
+        if ! check_tcp_port_reachable "$TARGET_IP" "$OUT_PORT"; then
+            echo -e "${YELLOW}[!] TCP порт недоступен (может быть firewall).${NC}"
+            read -p "Продолжить? (y/n): " continue_anyway
+            [[ "$continue_anyway" != "y" ]] && return 1
+        else
+            echo -e "${GREEN}[OK] TCP порт доступен${NC}"
+        fi
+    else
+        if ! check_udp_port_reachable "$TARGET_IP" "$OUT_PORT"; then
+            echo -e "${YELLOW}[!] UDP порт может быть недоступен.${NC}"
+            read -p "Продолжить? (y/n): " continue_anyway
+            [[ "$continue_anyway" != "y" ]] && return 1
+        else
+            echo -e "${GREEN}[OK] UDP порт доступен${NC}"
+        fi
+    fi
+
+    apply_iptables_rules "$PROTO" "$IN_PORT" "$OUT_PORT" "$TARGET_IP" "$NAME"
 }
 
 configure_custom_rule() {
@@ -612,6 +743,8 @@ configure_custom_rule() {
 
 configure_ipv4_to_ipv6_rule() {
     local PROTO=$1
+    local ALLOW_DIFFERENT_PORTS=$2
+    local TARGET_IP6=$3
     local PROTO_UPPER=$(echo "$PROTO" | tr '[:lower:]' '[:upper:]')
 
     echo -e "\n${CYAN}--- 🔀 IPv4 → IPv6 каскад ($PROTO_UPPER) ---${NC}"
@@ -631,7 +764,11 @@ configure_ipv4_to_ipv6_rule() {
     echo -e "${GREEN}[OK] IPv6 поддержка найдена.${NC}\n"
 
     while true; do
-        echo -e "Введите ${YELLOW}Порт${NC} (одинаковый для входа и выхода):"
+        if [[ "$ALLOW_DIFFERENT_PORTS" == "true" ]]; then
+            echo -e "Введите ${YELLOW}ВХОДЯЩИЙ Порт${NC} (на этом сервере):"
+        else
+            echo -e "Введите ${YELLOW}Порт${NC} (одинаковый для входа и выхода):"
+        fi
         read -p "> " IN_PORT
         if validate_port "$IN_PORT"; then 
             break
@@ -642,7 +779,7 @@ configure_ipv4_to_ipv6_rule() {
     # Проверка конфликта с SSH
     if check_ssh_port_conflict "$IN_PORT"; then
         if [[ "$PROTO" == "tcp" ]]; then
-            echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Порт $IN_PORT совпадает с SSH портом!${NC}"
+            echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Входящий порт $IN_PORT совпадает с SSH портом!${NC}"
             read -p "Нажмите Enter..."
             return 1
         fi
@@ -655,25 +792,41 @@ configure_ipv4_to_ipv6_rule() {
         return 1
     fi
 
-    while true; do
-        echo -e "Введите ${YELLOW}IPv6 адрес${NC} назначения (например: 2001:db8::1):"
-        read -p "> " TARGET_IP6
-        if validate_ipv6 "$TARGET_IP6"; then 
-            break
-        fi
-        echo -e "${RED}Ошибка: введите корректный IPv6 адрес!${NC}"
-    done
+    # Спросить выходящий порт, если требуются разные порты
+    local OUT_PORT="$IN_PORT"
+    if [[ "$ALLOW_DIFFERENT_PORTS" == "true" ]]; then
+        while true; do
+            echo -e "Введите ${YELLOW}ИСХОДЯЩИЙ Порт${NC} (на целевом сервере IPv6):"
+            read -p "> " OUT_PORT
+            if validate_port "$OUT_PORT"; then 
+                break
+            fi
+            echo -e "${RED}Ошибка: порт должен быть от 1 до 65535!${NC}"
+        done
+    fi
 
-    echo -e "${YELLOW}[*] Проверка доступности целевого IPv6 адреса [${TARGET_IP6}]:${IN_PORT}/${PROTO}...${NC}"
+    # Если TARGET_IP6 не передана, спросить её
+    if [[ -z "$TARGET_IP6" ]]; then
+        while true; do
+            echo -e "Введите ${YELLOW}IPv6 адрес${NC} назначения (например: 2001:db8::1):"
+            read -p "> " TARGET_IP6
+            if validate_ipv6 "$TARGET_IP6"; then 
+                break
+            fi
+            echo -e "${RED}Ошибка: введите корректный IPv6 адрес!${NC}"
+        done
+    fi
+
+    echo -e "${YELLOW}[*] Проверка доступности целевого IPv6 адреса [${TARGET_IP6}]:${OUT_PORT}/${PROTO}...${NC}"
     
     if [[ "$PROTO" == "tcp" ]]; then
-        if ! check_tcp_port_reachable "$TARGET_IP6" "$IN_PORT"; then
+        if ! check_tcp_port_reachable "$TARGET_IP6" "$OUT_PORT"; then
             echo -e "${YELLOW}[!] TCP порт на IPv6 может быть недоступен.${NC}"
             read -p "Продолжить? (y/n): " continue_anyway
             [[ "$continue_anyway" != "y" ]] && return 1
         fi
     else
-        if ! check_udp_port_reachable "$TARGET_IP6" "$IN_PORT"; then
+        if ! check_udp_port_reachable "$TARGET_IP6" "$OUT_PORT"; then
             echo -e "${YELLOW}[!] UDP порт на IPv6 может быть недоступен.${NC}"
             read -p "Продолжить? (y/n): " continue_anyway
             [[ "$continue_anyway" != "y" ]] && return 1
@@ -681,7 +834,6 @@ configure_ipv4_to_ipv6_rule() {
     fi
     echo -e "${GREEN}[OK] Целевой адрес доступен.${NC}\n"
 
-    local OUT_PORT="$IN_PORT"
     local SVC_NAME="socat-ipv6-${IN_PORT}-${PROTO}"
     local SVC_FILE="/etc/systemd/system/${SVC_NAME}.service"
 
@@ -742,7 +894,11 @@ EOF
     netfilter-persistent save > /dev/null 2>&1 || true
 
     echo -e "${GREEN}[SUCCESS] IPv4→IPv6 каскад настроен!${NC}"
-    echo -e "$PROTO_UPPER: ${SERVER_IP}:${IN_PORT} (IPv4) -> [${TARGET_IP6}]:${IN_PORT} (IPv6)"
+    if [[ "$OUT_PORT" != "$IN_PORT" ]]; then
+        echo -e "$PROTO_UPPER: ${SERVER_IP}:${IN_PORT} (IPv4) -> [${TARGET_IP6}]:${OUT_PORT} (IPv6)"
+    else
+        echo -e "$PROTO_UPPER: ${SERVER_IP}:${IN_PORT} (IPv4) -> [${TARGET_IP6}]:${IN_PORT} (IPv6)"
+    fi
     read -p "Нажмите Enter для возврата в меню..."
 }
 
@@ -1391,40 +1547,37 @@ show_menu() {
         echo -e "12) Восстановить backup"
         echo -e "13) ${RED}Удалить скрипт полностью${NC}"
         echo -e "14) Мониторинг VPS"
-        echo -e "15) Трафик по портам"
-        echo -e "16) Ограничить доступ по IP"
-        echo -e "17) Live подключения"
-        echo -e "18) 🔀 ${CYAN}IPv4 → IPv6 каскад UDP${NC} (socat)"
-        echo -e "19) 🔀 ${CYAN}IPv4 → IPv6 каскад TCP${NC} (socat)"
-        echo -e "20) ${BLUE}📖 Справка${NC}"
-        echo -e "0) Выход"
-        echo -e "------------------------------------------------------"
+         echo -e "15) Трафик по портам"
+         echo -e "16) Ограничить доступ по IP"
+         echo -e "17) Live подключения"
+         echo -e "18) ${BLUE}📖 Справка${NC}"
+         echo -e "0) Выход"
+         echo -e "------------------------------------------------------"
 
-        read -p "Ваш выбор: " choice
+         read -p "Ваш выбор: " choice
 
-        case $choice in
-            1) configure_rule "udp" "AmneziaWG / WireGuard" ;;
-            2) configure_rule "tcp" "VLESS / XRay" ;;
-            3) configure_rule "tcp" "MTProto / TProxy" ;;
-            4) configure_custom_rule ;;
-            5) list_active_rules ;;
-            6) delete_single_rule ;;
-            7) flush_rules ;;
-            8) show_promo ;;
-            9) show_instructions ;;
-            10) check_connection ;;
-            11) backup_rules ;;
-            12) restore_rules ;;
-            13) uninstall_script ;;
-            14) system_status ;;
-            15) port_traffic_stats ;;
-            16) lock_port_to_ip ;;
-            17) live_connections ;;
-            18) configure_ipv4_to_ipv6_rule "udp" ;;
-            19) configure_ipv4_to_ipv6_rule "tcp" ;;
-            20) show_help ;;
-            0) exit 0 ;;
-            *) ;;
+         case $choice in
+             1) configure_rule_auto_detect "udp" "AmneziaWG / WireGuard" "standard" ;;
+             2) configure_rule_auto_detect "tcp" "VLESS / XRay" "standard" ;;
+             3) configure_rule_auto_detect "tcp" "TProxy / MTProto" "different_ports" ;;
+             4) configure_custom_rule ;;
+             5) list_active_rules ;;
+             6) delete_single_rule ;;
+             7) flush_rules ;;
+             8) show_promo ;;
+             9) show_instructions ;;
+             10) check_connection ;;
+             11) backup_rules ;;
+             12) restore_rules ;;
+             13) uninstall_script ;;
+             14) system_status ;;
+             15) port_traffic_stats ;;
+             16) lock_port_to_ip ;;
+             17) live_connections ;;
+             18) show_help ;;
+             0) clear; exit 0 ;;
+
+            *) echo -e "${RED}Неверный выбор${NC}"; read -p "Нажмите Enter..." ;;
         esac
     done
 }
