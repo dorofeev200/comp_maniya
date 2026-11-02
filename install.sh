@@ -1442,20 +1442,28 @@ port_traffic_stats() {
         IN_PORT=$(echo "$svc_name" | sed 's/socat-ipv6-\([0-9]*\)-.*/\1/')
         PROTO=$(echo "$svc_name" | sed 's/.*-\(tcp\|udp\)$/\1/')
         
-        # Получаем адрес IPv6 из содержимого сервиса
-        if grep -q "TCP6:\|UDP6:" "$svc_file"; then
-            DEST=$(grep -oP 'TCP6:\K\[[^\]:]*\]:[0-9]*|UDP6:\K\[[^\]:]*\]:[0-9]*' "$svc_file" | head -1)
+        # Получаем адрес IPv6 из ExecStart строки
+        # Ищем IPv6:[<address>]:port в строке ExecStart
+        EXEC_LINE=$(grep "^ExecStart=" "$svc_file")
+        if [[ $PROTO == "tcp" ]]; then
+            DEST=$(echo "$EXEC_LINE" | grep -oP 'TCP6:\K\[[0-9a-f:]+\]:[0-9]+')
+        else
+            DEST=$(echo "$EXEC_LINE" | grep -oP 'UDP6:\K\[[0-9a-f:]+\]:[0-9]+')
         fi
         
-        # Получаем статистику из ss (количество соединений и примерный трафик)
-        CONNECTIONS=$(ss -tnp 2>/dev/null | grep -c "socat-ipv6-${IN_PORT}" || echo "0")
+        # Проверяем, запущен ли сервис и работает ли он
+        if systemctl is-active --quiet "socat-ipv6-${IN_PORT}-${PROTO}.service" 2>/dev/null; then
+            STATUS="active"
+            # Получаем количество процессов socat для этого порта
+            CONNECTIONS=$(pgrep -f "socat TCP4-LISTEN:${IN_PORT}|socat UDP4-LISTEN:${IN_PORT}" 2>/dev/null | wc -l)
+        else
+            STATUS="inactive"
+            CONNECTIONS=0
+        fi
         
-        if [[ -n "$IN_PORT" && -n "$PROTO" && -n "$DEST" && $CONNECTIONS -gt 0 ]]; then
+        if [[ -n "$IN_PORT" && -n "$PROTO" && -n "$DEST" ]]; then
             printf "%-8s %-8s %-22s %-12s %-12s\n" \
-                "$IN_PORT" "$PROTO" "$DEST" "$CONNECTIONS" "active"
-        elif [[ -n "$IN_PORT" && -n "$PROTO" && -n "$DEST" ]]; then
-            printf "%-8s %-8s %-22s %-12s %-12s\n" \
-                "$IN_PORT" "$PROTO" "$DEST" "0" "idle"
+                "$IN_PORT" "$PROTO" "$DEST" "$CONNECTIONS" "$STATUS"
         fi
     done
 
