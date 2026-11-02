@@ -1415,6 +1415,7 @@ port_traffic_stats() {
     printf "%-8s %-8s %-22s %-12s %-12s\n" "PORT" "PROTO" "DESTINATION" "PACKETS" "TRAFFIC"
     echo "---------------------------------------------------------------------"
 
+    # IPv4 из iptables
     iptables -t nat -L CM_DNAT_RULES -v -n 2>/dev/null | grep DNAT | while read -r line; do
         PACKETS=$(echo "$line" | awk '{print $1}')
         BYTES=$(echo "$line" | awk '{print $2}')
@@ -1427,6 +1428,34 @@ port_traffic_stats() {
 
             printf "%-8s %-8s %-22s %-12s %-12s\n" \
                 "$PORT" "$PROTO" "$DEST" "$PACKETS" "$TRAFFIC"
+        fi
+    done
+
+    # IPv6 из socat сервисов
+    for svc_file in /etc/systemd/system/socat-ipv6-*.service 2>/dev/null; do
+        if [[ ! -f "$svc_file" ]]; then
+            continue
+        fi
+        
+        # Парсим имя сервиса: socat-ipv6-PORT-PROTO.service
+        svc_name=$(basename "$svc_file" .service)
+        IN_PORT=$(echo "$svc_name" | sed 's/socat-ipv6-\([0-9]*\)-.*/\1/')
+        PROTO=$(echo "$svc_name" | sed 's/.*-\(tcp\|udp\)$/\1/')
+        
+        # Получаем адрес IPv6 из содержимого сервиса
+        if grep -q "TCP6:\|UDP6:" "$svc_file"; then
+            DEST=$(grep -oP 'TCP6:\K\[[^\]:]*\]:[0-9]*|UDP6:\K\[[^\]:]*\]:[0-9]*' "$svc_file" | head -1)
+        fi
+        
+        # Получаем статистику из ss (количество соединений и примерный трафик)
+        CONNECTIONS=$(ss -tnp 2>/dev/null | grep -c "socat-ipv6-${IN_PORT}" || echo "0")
+        
+        if [[ -n "$IN_PORT" && -n "$PROTO" && -n "$DEST" && $CONNECTIONS -gt 0 ]]; then
+            printf "%-8s %-8s %-22s %-12s %-12s\n" \
+                "$IN_PORT" "$PROTO" "$DEST" "$CONNECTIONS" "active"
+        elif [[ -n "$IN_PORT" && -n "$PROTO" && -n "$DEST" ]]; then
+            printf "%-8s %-8s %-22s %-12s %-12s\n" \
+                "$IN_PORT" "$PROTO" "$DEST" "0" "idle"
         fi
     done
 
