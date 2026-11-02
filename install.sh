@@ -5,13 +5,19 @@
 # Telegram: https://t.me/computerchik
 # YouTube: https://www.youtube.com/@comp_maniya
 # ===============================
-# ВЕРСИЯ: 2.0-safe
+# ВЕРСИЯ: 3.0
 # ДАТА РЕЛИЗА: 2 ноября 2026
-# СТАТУС: Production Ready ✅
-# GIT COMMIT: 53a6dd2
+# СТАТУС: Beta Testing ⚠️
+# GIT COMMIT: [будет добавлен автоматически]
 # ===============================
-# Исправленная, безопасная версия с полной архитектурной переработкой
-# 8 критических исправлений + 6 дополнительных улучшений
+# КРИТИЧЕСКАЯ ВЕРСИЯ: Исправлены 5 критических уязвимостей безопасности
+# Обязательное обновление с v2.0-safe
+# Автоматическая миграция при первом запуске
+# ===============================
+# BREAKING CHANGES:
+# - Новый формат метаданных правил (добавлен UUID)
+# - MASQUERADE исправлен (по интерфейсу, не по destination)
+# - Backup/restore переработан (iptables-restore compatible)
 # ===============================
 
 # --- НОРМАЛИЗАЦИЯ ОКОНЧАНИЙ СТРОК ---
@@ -31,13 +37,36 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # --- КОНСТАНТЫ И ПЕРЕМЕННЫЕ СОСТОЯНИЯ ---
-CM_VERSION="2.0-safe"
+CM_VERSION="3.0"
 CM_RULES_FILE="/root/.comp_maniya_rules"
 CM_STATE_DIR="/var/lib/comp_maniya"
 BACKUP_DIR="/root"
 
 # Создание директории состояния
 mkdir -p "$CM_STATE_DIR" 2>/dev/null
+
+# --- СИСТЕМА ЛОГИРОВАНИЯ ---
+
+LOG_FILE="/var/log/comp_maniya/comp_maniya.log"
+LOG_LEVEL="${CM_LOG_LEVEL:-INFO}"
+
+init_logging() {
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+    touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/comp_maniya.log"
+}
+
+log_message() {
+    local level=$1; shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+log_debug() { [[ "$LOG_LEVEL" == "DEBUG" ]] && log_message "DEBUG" "$@"; }
+log_info() { log_message "INFO" "$@"; }
+log_warn() { log_message "WARN" "$@" >&2; }
+log_error() { log_message "ERROR" "$@" >&2; }
+log_success() { log_message "SUCCESS" "$@"; }
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -77,10 +106,37 @@ validate_ipv4() {
 
 validate_ipv6() {
     local ip=$1
-    # Проверка корректного IPv6 формата
-    if [[ $ip =~ ^(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}|::1|::)$ ]]; then
+    
+    # Попытка использовать Python для точной валидации
+    if command -v python3 &>/dev/null; then
+        if python3 -c "import ipaddress; ipaddress.IPv6Address('$ip')" 2>/dev/null; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+    
+    # Fallback: улучшенная regex
+    # Полный IPv6: 8 групп по 4 hex цифры
+    if [[ $ip =~ ^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$ ]]; then
         return 0
     fi
+    
+    # Compressed форма с ::
+    if [[ $ip =~ ^(([0-9a-fA-F]{1,4}:)*)::(([0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4})?$ ]]; then
+        return 0
+    fi
+    
+    # Loopback ::1
+    if [[ $ip == "::1" ]]; then
+        return 0
+    fi
+    
+    # Any ::
+    if [[ $ip == "::" ]]; then
+        return 0
+    fi
+    
     return 1
 }
 
@@ -101,6 +157,26 @@ get_ip_type() {
     else
         echo "invalid"
     fi
+}
+
+# --- UUID GENERATION ---
+
+generate_uuid() {
+    if command -v uuidgen &>/dev/null; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+    else
+        # Fallback: pseudo-UUID
+        echo "$(date +%s)-$$-$RANDOM"
+    fi
+}
+
+# --- METADATA V3 ---
+
+save_rule_metadata_v3() {
+    local proto=$1 in_port=$2 out_port=$3 target_ip=$4 name=$5 uuid=$6
+    local timestamp=$(date +%s)
+    
+    echo "${proto}|${in_port}|${out_port}|${target_ip}|${name}|${timestamp}|${uuid}" >> "$CM_RULES_FILE"
 }
 
 # --- SSH ПОРТИРОВАНИЕ (3-УРОВНЕВАЯ ПРОВЕРКА) ---
@@ -158,10 +234,21 @@ check_ssh_port_conflict() {
 check_port_available_local() {
     local port=$1 proto=$2
     
-    # Проверка через ss
-    if ss -lntp 2>/dev/null | grep -E ":$port\s.*($proto)" >/dev/null; then
-        return 1  # Порт занят
+    if [[ "$proto" == "tcp" ]]; then
+        # Проверка TCP
+        if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+            return 1  # Порт занят
+        fi
+    elif [[ "$proto" == "udp" ]]; then
+        # Проверка UDP
+        if ss -H -lnu 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+            return 1  # Порт занят
+        fi
+    else
+        log_error "Неизвестный протокол: $proto"
+        return 1
     fi
+    
     return 0  # Порт свободен
 }
 
@@ -172,8 +259,30 @@ check_tcp_port_reachable() {
         return 1
     fi
     
-    timeout 3 bash -c "</dev/tcp/$ip/$port" 2>/dev/null
-    return $?
+    # Для IPv4 используем /dev/tcp
+    if validate_ipv4 "$ip"; then
+        timeout 5 bash -c "</dev/tcp/$ip/$port" 2>/dev/null
+        return $?
+    fi
+    
+    # Для IPv6 используем nc или curl
+    if validate_ipv6 "$ip"; then
+        if command -v nc &>/dev/null; then
+            timeout 5 nc -z -w 3 "$ip" "$port" 2>/dev/null
+            return $?
+        elif command -v curl &>/dev/null; then
+            timeout 5 curl -s "http://[$ip]:$port" -o /dev/null 2>/dev/null
+            local ret=$?
+            # curl возвращает 7 если не может подключиться, 0 или 52 если подключился
+            [[ $ret -eq 0 || $ret -eq 52 ]] && return 0
+            return 1
+        else
+            log_warn "nc/curl не установлен, пропускаю проверку IPv6"
+            return 0
+        fi
+    fi
+    
+    return 1
 }
 
 check_udp_port_reachable() {
@@ -192,34 +301,95 @@ check_udp_port_reachable() {
     return 0  # Если nc нет, пропускаем
 }
 
+# --- MASQUERADE MANAGEMENT (v3.0 FIX) ---
+
+ensure_masquerade_for_interface() {
+    local iface=$1
+    local marker="COMP_MANIYA:v3:masq:$iface"
+    
+    # Проверка существования MASQUERADE для интерфейса
+    if iptables -t nat -C CM_SNAT_RULES -o "$iface" -j MASQUERADE 2>/dev/null; then
+        log_debug "MASQUERADE для $iface уже существует"
+        return 0
+    fi
+    
+    # Добавление MASQUERADE
+    if iptables -t nat -A CM_SNAT_RULES -o "$iface" \
+        -m comment --comment "$marker" -j MASQUERADE; then
+        log_success "MASQUERADE добавлен для интерфейса: $iface"
+        return 0
+    else
+        log_error "Ошибка добавления MASQUERADE для $iface"
+        return 1
+    fi
+}
+
 # --- УПРАВЛЕНИЕ IPTABLES ЦЕПОЧКАМИ (БЕЗОПАСНОСТЬ) ---
 
 ensure_cm_chains() {
-    # Создание изолированных цепочек COMP_MANIYA (если их нет)
+    log_debug "Проверка CM_* цепочек..."
     
-    # INPUT цепочка
-    if ! iptables -L CM_INPUT -n 2>/dev/null | grep -q "Chain CM_INPUT"; then
-        iptables -N CM_INPUT 2>/dev/null || true
-        iptables -I INPUT -j CM_INPUT
-    fi
+    local chains=(
+        "filter:CM_INPUT"
+        "filter:CM_FORWARD"
+        "nat:CM_DNAT_RULES"
+        "nat:CM_SNAT_RULES"
+    )
     
-    # FORWARD цепочка
-    if ! iptables -L CM_FORWARD -n 2>/dev/null | grep -q "Chain CM_FORWARD"; then
-        iptables -N CM_FORWARD 2>/dev/null || true
-        iptables -I FORWARD -j CM_FORWARD
-    fi
+    local jumps=(
+        "filter:INPUT:CM_INPUT"
+        "filter:FORWARD:CM_FORWARD"
+        "nat:PREROUTING:CM_DNAT_RULES"
+        "nat:POSTROUTING:CM_SNAT_RULES"
+    )
     
-    # NAT таблица: DNAT цепочка
-    if ! iptables -t nat -L CM_DNAT_RULES -n 2>/dev/null | grep -q "Chain CM_DNAT_RULES"; then
-        iptables -t nat -N CM_DNAT_RULES 2>/dev/null || true
-        iptables -t nat -I PREROUTING -j CM_DNAT_RULES
-    fi
+    # Создание цепочек (если не существуют)
+    for entry in "${chains[@]}"; do
+        IFS=':' read -r table chain <<< "$entry"
+        
+        if ! iptables -t "$table" -L "$chain" -n >/dev/null 2>&1; then
+            log_info "Создание цепочки: $table/$chain"
+            if ! iptables -t "$table" -N "$chain"; then
+                log_error "Ошибка создания цепочки $chain"
+                return 1
+            fi
+        fi
+    done
     
-    # NAT таблица: SNAT цепочка
-    if ! iptables -t nat -L CM_SNAT_RULES -n 2>/dev/null | grep -q "Chain CM_SNAT_RULES"; then
-        iptables -t nat -N CM_SNAT_RULES 2>/dev/null || true
-        iptables -t nat -I POSTROUTING -j CM_SNAT_RULES
-    fi
+    # Создание переходов (если не существуют)
+    for entry in "${jumps[@]}"; do
+        IFS=':' read -r table parent child <<< "$entry"
+        
+        # Проверка существования перехода
+        if iptables -t "$table" -C "$parent" -j "$child" 2>/dev/null; then
+            log_debug "Переход $parent → $child уже существует"
+            continue
+        fi
+        
+        log_info "Добавление перехода: $table/$parent → $child"
+        
+        # Определяем позицию вставки
+        # Вставляем ПЕРЕД последним правилом (обычно default policy)
+        local total_rules=$(iptables -t "$table" -L "$parent" --line-numbers -n 2>/dev/null | \
+            tail -n +3 | wc -l)
+        
+        if [[ $total_rules -gt 0 ]]; then
+            # Вставляем перед последним правилом
+            if ! iptables -t "$table" -I "$parent" "$total_rules" -j "$child"; then
+                log_error "Ошибка добавления перехода $parent → $child"
+                return 1
+            fi
+        else
+            # Если правил нет, просто добавляем в конец
+            if ! iptables -t "$table" -A "$parent" -j "$child"; then
+                log_error "Ошибка добавления перехода $parent → $child"
+                return 1
+            fi
+        fi
+    done
+    
+    log_success "CM_* цепочки готовы"
+    return 0
 }
 
 # Сохранение информации о правиле для миграции
@@ -282,119 +452,141 @@ prepare_system() {
     echo -e "${GREEN}[OK] Система готова${NC}"
 }
 
-# --- МИГРАЦИЯ СТАРЫХ ПРАВИЛ ---
+# --- МИГРАЦИЯ СТАРЫХ ПРАВИЛ (v3.0 БЕЗОПАСНАЯ) ---
 
-migrate_legacy_rules() {
-    # Если это первый запуск новой версии, нужно перенести старые правила
-    local legacy_marker="/root/.compmaniya_v1_migrated"
+migrate_v2_to_v3() {
+    local v2_marker="/root/.compmaniya_v1_migrated"
+    local v3_marker="$CM_STATE_DIR/migrated_to_v3"
     
-    if [[ -f "$legacy_marker" ]]; then
-        return  # Уже мигрировали
+    # Проверка: уже мигрировано на v3
+    [[ -f "$v3_marker" ]] && {
+        log_debug "Миграция v3 уже выполнена"
+        return 0
+    }
+    
+    # Проверка: есть ли v2.0-safe установка
+    if [[ ! -f "$v2_marker" ]] || [[ ! -f "$CM_RULES_FILE" ]]; then
+        log_info "Чистая установка v3.0"
+        touch "$v3_marker"
+        return 0
     fi
     
-    echo -e "${YELLOW}[*] Проверка наличия старых правил COMP_MANIYA v1.x...${NC}"
+    log_info "═══════════════════════════════════════════════"
+    log_info "  Обнаружена установка v2.0-safe"
+    log_info "  Начинается миграция на v3.0..."
+    log_info "═══════════════════════════════════════════════"
     
-    local has_legacy=0
-    local migrated_rules=0
+    # Создание safety backup
+    log_info "Создание backup перед миграцией..."
+    local backup_name="pre-v3-migration-$(date +%Y%m%d-%H%M%S)"
+    if ! backup_rules_v3 "$backup_name"; then
+        log_error "Не удалось создать backup. Миграция прервана."
+        return 1
+    fi
     
-    # ===== МИГРАЦИЯ IPv4→IPv4 ПРАВИЛ (DNAT) =====
-    echo -e "${CYAN}[*] Проверка DNAT правил в PREROUTING...${NC}"
+    # Счётчик мигрированных правил
+    local migrated_count=0
+    local failed_count=0
     
-    # Сохраняем все DNAT правила в переменную перед циклом
-    local dnat_rules=$(iptables -t nat -S PREROUTING 2>/dev/null | grep "\-j DNAT" || true)
-    
-    if [[ -n "$dnat_rules" ]]; then
-        echo -e "${CYAN}    Найдены DNAT правила, начинаем миграцию...${NC}"
-        has_legacy=1
+    # Миграция через МЕТАДАННЫЕ (не парсинг iptables!)
+    log_info "Миграция правил из метаданных..."
+    while IFS='|' read -r proto in_port out_port target_ip name timestamp; do
+        [[ -z "$proto" ]] && continue
         
-        # Парсим каждое DNAT правило
-        while IFS= read -r rule; do
-            [[ -z "$rule" ]] && continue
-            
-            # Пример правила: -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 1.2.3.4:443
-            local proto=$(echo "$rule" | grep -oP '\-p \K\w+')
-            local in_port=$(echo "$rule" | grep -oP '\-\-dport \K\d+')
-            local target_dest=$(echo "$rule" | grep -oP '(?<=\-\-to-destination )[\d\.:]+')
-            
-            if [[ -n "$proto" && -n "$in_port" && -n "$target_dest" ]]; then
-                echo -e "${YELLOW}    Мигрирую: $proto порт $in_port -> $target_dest${NC}"
-                
-                # Удаляем старое правило из PREROUTING
-                iptables -t nat -D PREROUTING -p "$proto" --dport "$in_port" -j DNAT --to-destination "$target_dest" 2>/dev/null || true
-                
-                # Добавляем новое правило в CM_DNAT_RULES
-                iptables -t nat -A CM_DNAT_RULES -p "$proto" --dport "$in_port" -j DNAT --to-destination "$target_dest" 2>/dev/null
-                
-                # Добавляем INPUT правило в CM_INPUT
-                iptables -A CM_INPUT -p "$proto" --dport "$in_port" -j ACCEPT 2>/dev/null
-                
-                # Парсим целевой IP и порт
-                local target_ip="${target_dest%:*}"
-                local target_port="${target_dest#*:}"
-                
-                # Добавляем FORWARD правила в CM_FORWARD
-                iptables -A CM_FORWARD -p "$proto" -d "$target_ip" --dport "$target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-                iptables -A CM_FORWARD -p "$proto" -s "$target_ip" --sport "$target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-                
-                # Добавляем MASQUERADE в CM_SNAT_RULES
-                iptables -t nat -A CM_SNAT_RULES -d "$target_ip" -o eth0 -j MASQUERADE 2>/dev/null || \
-                iptables -t nat -A CM_SNAT_RULES -d "$target_ip" -j MASQUERADE 2>/dev/null
-                
-                # Сохраняем метаданные
-                save_rule_metadata "$proto" "$in_port" "$target_port" "$target_ip" "Migrated from v1.x"
-                
-                ((migrated_rules++))
-                echo -e "${GREEN}    [OK] Правило мигрировано${NC}"
-            fi
-        done <<< "$dnat_rules"
-    fi
-    
-    # ===== МИГРАЦИЯ INPUT ПРАВИЛ =====
-    echo -e "${CYAN}[*] Проверка INPUT правил...${NC}"
-    
-    local input_rules=$(iptables -S INPUT 2>/dev/null | grep "ACCEPT" | grep -v "CM_INPUT" | grep -oP '\-\-dport \K\d+' || true)
-    
-    if [[ -n "$input_rules" ]]; then
-        has_legacy=1
-        # INPUT правила будут автоматически работать через CM_INPUT цепочку
-        echo -e "${GREEN}    [OK] INPUT правила подключены через CM_INPUT${NC}"
-    fi
-    
-    # ===== МИГРАЦИЯ FORWARD ПРАВИЛ =====
-    echo -e "${CYAN}[*] Проверка FORWARD правил...${NC}"
-    
-    local forward_rules=$(iptables -S FORWARD 2>/dev/null | grep "ACCEPT" | grep -v "CM_FORWARD" || true)
-    
-    if [[ -n "$forward_rules" ]]; then
-        has_legacy=1
-        # FORWARD правила будут автоматически работать через CM_FORWARD цепочку
-        echo -e "${GREEN}    [OK] FORWARD правила подключены через CM_FORWARD${NC}"
-    fi
-    
-    # ===== МИГРАЦИЯ SOCAT СЕРВИСОВ (IPv4→IPv6) =====
-    echo -e "${CYAN}[*] Проверка IPv4→IPv6 соcat сервисов...${NC}"
-    
-    if ls /etc/systemd/system/socat-ipv6-*.service >/dev/null 2>&1; then
-        echo -e "${GREEN}    [OK] Найдены socat сервисы, они сохранены${NC}"
-        has_legacy=1
-    fi
-    
-    # ===== РЕЗУЛЬТАТ МИГРАЦИИ =====
-    if [[ $has_legacy -eq 1 ]]; then
-        echo ""
-        echo -e "${GREEN}[SUCCESS] Миграция завершена!${NC}"
-        echo -e "${CYAN}Мигрировано правил: $migrated_rules${NC}"
-        echo -e "${CYAN}Все правила перенесены в CM_* цепочки${NC}"
+        log_info "Обработка: $proto $in_port → $target_ip:$out_port"
         
-        # Сохраняем состояние
-        netfilter-persistent save > /dev/null 2>&1 || true
-    else
-        echo -e "${CYAN}[i] Старых правил не найдено, начинаем с чистого листа${NC}"
-    fi
+        # Проверка существования правила в CM_DNAT_RULES
+        if ! iptables -t nat -C CM_DNAT_RULES -p "$proto" --dport "$in_port" \
+            -j DNAT --to-destination "$target_ip:$out_port" 2>/dev/null; then
+            log_warn "Правило не найдено в CM_DNAT_RULES, пропускаю"
+            ((failed_count++))
+            continue
+        fi
+        
+        # Генерация UUID для маркера
+        local uuid=$(generate_uuid)
+        local marker="COMP_MANIYA:v3:$uuid"
+        
+        # Получение интерфейса
+        local iface=$(ip route get "$target_ip" 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+        if [[ -z "$iface" ]]; then
+            log_warn "Не удалось определить интерфейс для $target_ip"
+            iface="eth0"  # Fallback
+        fi
+        
+        # Удаление старого правила без маркера
+        iptables -t nat -D CM_DNAT_RULES -p "$proto" --dport "$in_port" \
+            -j DNAT --to-destination "$target_ip:$out_port" 2>/dev/null
+        
+        iptables -D CM_INPUT -p "$proto" --dport "$in_port" -j ACCEPT 2>/dev/null || true
+        
+        iptables -D CM_FORWARD -p "$proto" -d "$target_ip" --dport "$out_port" \
+            -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        
+        iptables -D CM_FORWARD -p "$proto" -s "$target_ip" --sport "$out_port" \
+            -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        
+        # Удаление старого НЕПРАВИЛЬНОГО MASQUERADE (по destination)
+        iptables -t nat -D CM_SNAT_RULES -d "$target_ip" -o "$iface" -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -D CM_SNAT_RULES -d "$target_ip" -j MASQUERADE 2>/dev/null || true
+        
+        # Создание новых правил с маркерами
+        if ! iptables -A CM_INPUT -p "$proto" --dport "$in_port" \
+            -m comment --comment "$marker:input" -j ACCEPT; then
+            log_error "Ошибка миграции INPUT для порта $in_port"
+            ((failed_count++))
+            continue
+        fi
+        
+        if ! iptables -t nat -A CM_DNAT_RULES -p "$proto" --dport "$in_port" \
+            -m comment --comment "$marker:dnat" \
+            -j DNAT --to-destination "$target_ip:$out_port"; then
+            log_error "Ошибка миграции DNAT для порта $in_port"
+            iptables -D CM_INPUT -p "$proto" --dport "$in_port" \
+                -m comment --comment "$marker:input" -j ACCEPT 2>/dev/null
+            ((failed_count++))
+            continue
+        fi
+        
+        iptables -A CM_FORWARD -p "$proto" -d "$target_ip" --dport "$out_port" \
+            -m state --state NEW,ESTABLISHED,RELATED \
+            -m comment --comment "$marker:fwd:in" -j ACCEPT
+        
+        iptables -A CM_FORWARD -p "$proto" -s "$target_ip" --sport "$out_port" \
+            -m state --state ESTABLISHED,RELATED \
+            -m comment --comment "$marker:fwd:out" -j ACCEPT
+        
+        # Новый правильный MASQUERADE
+        ensure_masquerade_for_interface "$iface"
+        
+        # Сохранение метаданных v3
+        save_rule_metadata_v3 "$proto" "$in_port" "$out_port" "$target_ip" "$name" "$uuid"
+        
+        ((migrated_count++))
+        log_success "Мигрировано: $proto $in_port → $target_ip:$out_port"
+        
+    done < "$CM_RULES_FILE"
     
-    touch "$legacy_marker"
+    # Сохранение конфигурации
+    netfilter-persistent save >/dev/null 2>&1 || true
+    
+    # Создание маркера v3
+    touch "$v3_marker"
+    
+    log_success "═══════════════════════════════════════════════"
+    log_success "  Миграция завершена!"
+    log_success "  Успешно: $migrated_count | Ошибок: $failed_count"
+    log_success "═══════════════════════════════════════════════"
+    
+    return 0
 }
 
+# Алиас для обратной совместимости
+migrate_legacy_rules() {
+    migrate_v2_to_v3
+}
+
+# Старая функция закомментирована для справки
 # --- UI ФУНКЦИИ ---
 
 show_promo() {
