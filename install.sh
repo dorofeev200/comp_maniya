@@ -281,32 +281,104 @@ migrate_legacy_rules() {
         return  # Уже мигрировали
     fi
     
-    echo -e "${YELLOW}[*] Проверка наличия старых правил COMP_MANIYA...${NC}"
+    echo -e "${YELLOW}[*] Проверка наличия старых правил COMP_MANIYA v1.x...${NC}"
     
     local has_legacy=0
+    local migrated_rules=0
     
-    # Проверка старых DNAT правил (не в CM_DNAT_RULES)
-    if iptables -t nat -S PREROUTING 2>/dev/null | grep -q "DNAT" && \
-       ! iptables -t nat -S PREROUTING | grep "CM_DNAT_RULES" >/dev/null; then
+    # ===== МИГРАЦИЯ IPv4→IPv4 ПРАВИЛ (DNAT) =====
+    echo -e "${CYAN}[*] Проверка DNAT правил в PREROUTING...${NC}"
+    
+    # Сохраняем все DNAT правила в переменную перед циклом
+    local dnat_rules=$(iptables -t nat -S PREROUTING 2>/dev/null | grep "\-j DNAT" || true)
+    
+    if [[ -n "$dnat_rules" ]]; then
+        echo -e "${CYAN}    Найдены DNAT правила, начинаем миграцию...${NC}"
         has_legacy=1
+        
+        # Парсим каждое DNAT правило
+        while IFS= read -r rule; do
+            [[ -z "$rule" ]] && continue
+            
+            # Пример правила: -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 1.2.3.4:443
+            local proto=$(echo "$rule" | grep -oP '\-p \K\w+')
+            local in_port=$(echo "$rule" | grep -oP '\-\-dport \K\d+')
+            local target_dest=$(echo "$rule" | grep -oP '(?<=\-\-to-destination )[\d\.:]+')
+            
+            if [[ -n "$proto" && -n "$in_port" && -n "$target_dest" ]]; then
+                echo -e "${YELLOW}    Мигрирую: $proto порт $in_port -> $target_dest${NC}"
+                
+                # Удаляем старое правило из PREROUTING
+                iptables -t nat -D PREROUTING -p "$proto" --dport "$in_port" -j DNAT --to-destination "$target_dest" 2>/dev/null || true
+                
+                # Добавляем новое правило в CM_DNAT_RULES
+                iptables -t nat -A CM_DNAT_RULES -p "$proto" --dport "$in_port" -j DNAT --to-destination "$target_dest" 2>/dev/null
+                
+                # Добавляем INPUT правило в CM_INPUT
+                iptables -A CM_INPUT -p "$proto" --dport "$in_port" -j ACCEPT 2>/dev/null
+                
+                # Парсим целевой IP и порт
+                local target_ip="${target_dest%:*}"
+                local target_port="${target_dest#*:}"
+                
+                # Добавляем FORWARD правила в CM_FORWARD
+                iptables -A CM_FORWARD -p "$proto" -d "$target_ip" --dport "$target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+                iptables -A CM_FORWARD -p "$proto" -s "$target_ip" --sport "$target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+                
+                # Добавляем MASQUERADE в CM_SNAT_RULES
+                iptables -t nat -A CM_SNAT_RULES -d "$target_ip" -o eth0 -j MASQUERADE 2>/dev/null || \
+                iptables -t nat -A CM_SNAT_RULES -d "$target_ip" -j MASQUERADE 2>/dev/null
+                
+                # Сохраняем метаданные
+                save_rule_metadata "$proto" "$in_port" "$target_port" "$target_ip" "Migrated from v1.x"
+                
+                ((migrated_rules++))
+                echo -e "${GREEN}    [OK] Правило мигрировано${NC}"
+            fi
+        done <<< "$dnat_rules"
     fi
     
-    # Проверка старых socat сервисов
+    # ===== МИГРАЦИЯ INPUT ПРАВИЛ =====
+    echo -e "${CYAN}[*] Проверка INPUT правил...${NC}"
+    
+    local input_rules=$(iptables -S INPUT 2>/dev/null | grep "ACCEPT" | grep -v "CM_INPUT" | grep -oP '\-\-dport \K\d+' || true)
+    
+    if [[ -n "$input_rules" ]]; then
+        has_legacy=1
+        # INPUT правила будут автоматически работать через CM_INPUT цепочку
+        echo -e "${GREEN}    [OK] INPUT правила подключены через CM_INPUT${NC}"
+    fi
+    
+    # ===== МИГРАЦИЯ FORWARD ПРАВИЛ =====
+    echo -e "${CYAN}[*] Проверка FORWARD правил...${NC}"
+    
+    local forward_rules=$(iptables -S FORWARD 2>/dev/null | grep "ACCEPT" | grep -v "CM_FORWARD" || true)
+    
+    if [[ -n "$forward_rules" ]]; then
+        has_legacy=1
+        # FORWARD правила будут автоматически работать через CM_FORWARD цепочку
+        echo -e "${GREEN}    [OK] FORWARD правила подключены через CM_FORWARD${NC}"
+    fi
+    
+    # ===== МИГРАЦИЯ SOCAT СЕРВИСОВ (IPv4→IPv6) =====
+    echo -e "${CYAN}[*] Проверка IPv4→IPv6 соcat сервисов...${NC}"
+    
     if ls /etc/systemd/system/socat-ipv6-*.service >/dev/null 2>&1; then
+        echo -e "${GREEN}    [OK] Найдены socat сервисы, они сохранены${NC}"
         has_legacy=1
     fi
     
+    # ===== РЕЗУЛЬТАТ МИГРАЦИИ =====
     if [[ $has_legacy -eq 1 ]]; then
-        echo -e "${CYAN}[*] Найдены старые правила. Автоматическая миграция...${NC}"
+        echo ""
+        echo -e "${GREEN}[SUCCESS] Миграция завершена!${NC}"
+        echo -e "${CYAN}Мигрировано правил: $migrated_rules${NC}"
+        echo -e "${CYAN}Все правила перенесены в CM_* цепочки${NC}"
         
-        # Миграция DNAT правил
-        iptables -t nat -S PREROUTING 2>/dev/null | grep "DNAT" | while read -r rule; do
-            # Вставить в CM_DNAT_RULES вместо PREROUTING
-            local modified_rule="${rule//PREROUTING/CM_DNAT_RULES}"
-            eval "$modified_rule" 2>/dev/null || true
-        done
-        
-        echo -e "${GREEN}[OK] Старые правила перенесены в CM_* цепочки${NC}"
+        # Сохраняем состояние
+        netfilter-persistent save > /dev/null 2>&1 || true
+    else
+        echo -e "${CYAN}[i] Старых правил не найдено, начинаем с чистого листа${NC}"
     fi
     
     touch "$legacy_marker"
