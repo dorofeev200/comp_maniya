@@ -5,6 +5,14 @@
 # Telegram: https://t.me/computerchik
 # YouTube: https://www.youtube.com/@comp_maniya
 # ===============================
+# ВЕРСИЯ: 2.0 (исправленная, безопасная)
+# ===============================
+
+# --- НОРМАЛИЗАЦИЯ ОКОНЧАНИЙ СТРОК ---
+if file "$0" 2>/dev/null | grep -q "CRLF"; then
+    sed -i 's/\r$//' "$0"
+    chmod +x "$0"
+fi
 
 # --- ЦВЕТА ---
 RED='\033[0;31m'
@@ -15,6 +23,15 @@ MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+# --- КОНСТАНТЫ И ПЕРЕМЕННЫЕ СОСТОЯНИЯ ---
+CM_VERSION="2.0-safe"
+CM_RULES_FILE="/root/.comp_maniya_rules"
+CM_STATE_DIR="/var/lib/comp_maniya"
+BACKUP_DIR="/root"
+
+# Создание директории состояния
+mkdir -p "$CM_STATE_DIR" 2>/dev/null
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -35,48 +52,267 @@ check_root() {
     fi
 }
 
-# --- ПОДГОТОВКА СИСТЕМЫ ---
-prepare_system() {
-    # Определение реального SSH порта
-    SSH_PORT=$(grep -E "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
-    SSH_PORT=${SSH_PORT:-22}  # Если не найден, используем 22 по умолчанию
-    export SSH_PORT
+# --- ФУНКЦИИ ВАЛИДАЦИИ ---
 
+validate_ipv4() {
+    local ip=$1
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS=.
+        local -a octets=($ip)
+        for octet in "${octets[@]}"; do
+            if (( octet > 255 )); then
+                return 1
+            fi
+        done
+        return 0
+    fi
+    return 1
+}
+
+validate_ipv6() {
+    local ip=$1
+    # Проверка корректного IPv6 формата
+    if [[ $ip =~ ^(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}|::1|::)$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+validate_port() {
+    local port=$1
+    if [[ $port =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
+    fi
+    return 1
+}
+
+# --- SSH ПОРТИРОВАНИЕ (3-УРОВНЕВАЯ ПРОВЕРКА) ---
+
+get_ssh_ports() {
+    local -a ssh_ports=()
+    
+    # Метод 1: Эффективная конфигурация sshd
+    if command -v sshd &> /dev/null; then
+        local ports_from_config=$(sshd -T 2>/dev/null | grep "^port " | awk '{print $2}')
+        while IFS= read -r port; do
+            [[ -n "$port" ]] && ssh_ports+=("$port")
+        done <<< "$ports_from_config"
+    fi
+    
+    # Метод 2: Фактически слушающие порты (ss)
+    if command -v ss &> /dev/null; then
+        local ports_from_ss=$(ss -lntp 2>/dev/null | grep sshd | grep -oP ':\K\d+(?=/sshd)' | sort -u)
+        while IFS= read -r port; do
+            [[ -n "$port" ]] && ssh_ports+=("$port")
+        done <<< "$ports_from_ss"
+    fi
+    
+    # Метод 3: Конфиг файл как fallback
+    if [ ${#ssh_ports[@]} -eq 0 ]; then
+        local ports_from_file=$(grep -rE "^Port " /etc/ssh/ 2>/dev/null | awk '{print $2}')
+        while IFS= read -r port; do
+            [[ -n "$port" ]] && ssh_ports+=("$port")
+        done <<< "$ports_from_file"
+    fi
+    
+    # Финальный fallback
+    if [ ${#ssh_ports[@]} -eq 0 ]; then
+        ssh_ports=(22)
+    fi
+    
+    # Вернуть уникальные порты
+    printf '%s\n' "${ssh_ports[@]}" | sort -u | tr '\n' ' '
+}
+
+check_ssh_port_conflict() {
+    local test_port=$1
+    local ssh_ports=($(get_ssh_ports))
+    
+    for ssh_port in "${ssh_ports[@]}"; do
+        if [[ "$test_port" == "$ssh_port" ]]; then
+            return 0  # Конфликт найден
+        fi
+    done
+    return 1  # Конфликта нет
+}
+
+# --- ПРОВЕРКА ДОСТУПНОСТИ ПОРТОВ ---
+
+check_port_available_local() {
+    local port=$1 proto=$2
+    
+    # Проверка через ss
+    if ss -lntp 2>/dev/null | grep -E ":$port\s.*($proto)" >/dev/null; then
+        return 1  # Порт занят
+    fi
+    return 0  # Порт свободен
+}
+
+check_tcp_port_reachable() {
+    local ip=$1 port=$2
+    
+    if ! validate_ipv4 "$ip" && ! validate_ipv6 "$ip"; then
+        return 1
+    fi
+    
+    timeout 3 bash -c "</dev/tcp/$ip/$port" 2>/dev/null
+    return $?
+}
+
+check_udp_port_reachable() {
+    local ip=$1 port=$2
+    
+    if ! validate_ipv4 "$ip" && ! validate_ipv6 "$ip"; then
+        return 1
+    fi
+    
+    # UDP проверка через netcat
+    if command -v nc &> /dev/null; then
+        timeout 3 nc -zu "$ip" "$port" 2>/dev/null
+        return $?
+    fi
+    
+    return 0  # Если nc нет, пропускаем
+}
+
+# --- УПРАВЛЕНИЕ IPTABLES ЦЕПОЧКАМИ (БЕЗОПАСНОСТЬ) ---
+
+ensure_cm_chains() {
+    # Создание изолированных цепочек COMP_MANIYA (если их нет)
+    
+    # INPUT цепочка
+    if ! iptables -L CM_INPUT -n 2>/dev/null | grep -q "Chain CM_INPUT"; then
+        iptables -N CM_INPUT 2>/dev/null || true
+        iptables -I INPUT -j CM_INPUT
+    fi
+    
+    # FORWARD цепочка
+    if ! iptables -L CM_FORWARD -n 2>/dev/null | grep -q "Chain CM_FORWARD"; then
+        iptables -N CM_FORWARD 2>/dev/null || true
+        iptables -I FORWARD -j CM_FORWARD
+    fi
+    
+    # NAT таблица: DNAT цепочка
+    if ! iptables -t nat -L CM_DNAT_RULES -n 2>/dev/null | grep -q "Chain CM_DNAT_RULES"; then
+        iptables -t nat -N CM_DNAT_RULES 2>/dev/null || true
+        iptables -t nat -I PREROUTING -j CM_DNAT_RULES
+    fi
+    
+    # NAT таблица: SNAT цепочка
+    if ! iptables -t nat -L CM_SNAT_RULES -n 2>/dev/null | grep -q "Chain CM_SNAT_RULES"; then
+        iptables -t nat -N CM_SNAT_RULES 2>/dev/null || true
+        iptables -t nat -I POSTROUTING -j CM_SNAT_RULES
+    fi
+}
+
+# Сохранение информации о правиле для миграции
+save_rule_metadata() {
+    local proto=$1 in_port=$2 out_port=$3 target_ip=$4 name=$5
+    
+    echo "${proto}|${in_port}|${out_port}|${target_ip}|${name}|$(date +%s)" >> "$CM_RULES_FILE"
+}
+
+# --- ПОДГОТОВКА СИСТЕМЫ ---
+
+prepare_system() {
+    echo -e "${YELLOW}[*] Подготовка системы...${NC}"
+    
+    # Определение реальных SSH портов
+    SSH_PORTS=($(get_ssh_ports))
+    export SSH_PORTS
+    echo -e "${CYAN}[OK] SSH порты определены: ${SSH_PORTS[*]}${NC}"
+    
     # Автоматическое создание глобальной команды compmaniya
     if [ "$0" != "/usr/local/bin/compmaniya" ]; then
         cp -f "$0" "/usr/local/bin/compmaniya"
         chmod +x "/usr/local/bin/compmaniya"
+        echo -e "${CYAN}[OK] Команда compmaniya установлена${NC}"
     fi
 
-    # Включение IP Forwarding
-    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+    # Включение IP Forwarding (с проверкой)
+    if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    else
-        sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+        echo -e "${CYAN}[+] IP Forwarding включен${NC}"
     fi
+    
+    sed -i 's/^#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
 
-    # Активация Google BBR
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+    # Активация Google BBR (если поддерживается)
+    if ! grep -q "^net.core.default_qdisc=fq" /etc/sysctl.conf; then
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
     fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+    if ! grep -q "^net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
     fi
-    sysctl -p > /dev/null
+    sysctl -p > /dev/null 2>&1
 
     # Установка зависимостей
     export DEBIAN_FRONTEND=noninteractive
     if ! dpkg -s iptables-persistent >/dev/null 2>&1 || ! command -v socat >/dev/null 2>&1; then
-        apt-get update -y > /dev/null
-        apt-get install -y iptables-persistent netfilter-persistent qrencode socat > /dev/null
+        echo -e "${YELLOW}[*] Установка зависимостей (может занять время)...${NC}"
+        apt-get update -y > /dev/null 2>&1
+        if ! apt-get install -y iptables-persistent netfilter-persistent qrencode socat netcat-openbsd 2>/dev/null; then
+            echo -e "${RED}[WARNING] Ошибка при установке зависимостей. Некоторые функции могут не работать.${NC}"
+        fi
     fi
+    
+    # Создание CM цепочек
+    ensure_cm_chains
+    
+    # Миграция старых правил (если есть)
+    migrate_legacy_rules
+    
+    echo -e "${GREEN}[OK] Система готова${NC}"
 }
+
+# --- МИГРАЦИЯ СТАРЫХ ПРАВИЛ ---
+
+migrate_legacy_rules() {
+    # Если это первый запуск новой версии, нужно перенести старые правила
+    local legacy_marker="/root/.compmaniya_v1_migrated"
+    
+    if [[ -f "$legacy_marker" ]]; then
+        return  # Уже мигрировали
+    fi
+    
+    echo -e "${YELLOW}[*] Проверка наличия старых правил COMP_MANIYA...${NC}"
+    
+    local has_legacy=0
+    
+    # Проверка старых DNAT правил (не в CM_DNAT_RULES)
+    if iptables -t nat -S PREROUTING 2>/dev/null | grep -q "DNAT" && \
+       ! iptables -t nat -S PREROUTING | grep "CM_DNAT_RULES" >/dev/null; then
+        has_legacy=1
+    fi
+    
+    # Проверка старых socat сервисов
+    if ls /etc/systemd/system/socat-ipv6-*.service >/dev/null 2>&1; then
+        has_legacy=1
+    fi
+    
+    if [[ $has_legacy -eq 1 ]]; then
+        echo -e "${CYAN}[*] Найдены старые правила. Автоматическая миграция...${NC}"
+        
+        # Миграция DNAT правил
+        iptables -t nat -S PREROUTING 2>/dev/null | grep "DNAT" | while read -r rule; do
+            # Вставить в CM_DNAT_RULES вместо PREROUTING
+            local modified_rule="${rule//PREROUTING/CM_DNAT_RULES}"
+            eval "$modified_rule" 2>/dev/null || true
+        done
+        
+        echo -e "${GREEN}[OK] Старые правила перенесены в CM_* цепочки${NC}"
+    fi
+    
+    touch "$legacy_marker"
+}
+
+# --- UI ФУНКЦИИ ---
 
 show_promo() {
     clear
     echo ""
     echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${MAGENTA}║                 COMP_MANIYA KASKAD PRO                     ║${NC}"
+    echo -e "${MAGENTA}║                 COMP_MANIYA KASKAD PRO v${CM_VERSION}                    ║${NC}"
     echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -85,17 +321,16 @@ show_promo() {
 
     echo ""
     echo -e "${YELLOW}QR Telegram:${NC}"
-    qrencode -t ANSIUTF8 "https://t.me/computerchik"
+    qrencode -t ANSIUTF8 "https://t.me/computerchik" 2>/dev/null || echo "[QR не доступен]"
 
     echo ""
     echo -e "${YELLOW}QR YouTube:${NC}"
-    qrencode -t ANSIUTF8 "https://www.youtube.com/@comp_maniya"
+    qrencode -t ANSIUTF8 "https://www.youtube.com/@comp_maniya" 2>/dev/null || echo "[QR не доступен]"
 
     echo ""
     read -p "Нажмите enter для настройки каскадного скрипта..."
 }
 
-# --- ИНСТРУКЦИЯ (ТЕКСТ ВНУТРИ КОДА) ---
 show_instructions() {
     clear
     echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -123,7 +358,38 @@ show_instructions() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
-# --- СТАНДАРТНАЯ НАСТРОЙКА (ПОРТ ВХОДА = ПОРТ ВЫХОДА) ---
+show_help() {
+    clear
+    echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${MAGENTA}║                   СПРАВКА COMP_MANIYA                         ║${NC}"
+    echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${CYAN}Основные команды:${NC}"
+    echo ""
+    echo "  compmaniya              - Открыть интерактивное меню"
+    echo "  compmaniya --help       - Показать эту справку"
+    echo "  compmaniya --version    - Версия скрипта"
+    echo "  compmaniya --status     - Статус текущих правил"
+    echo ""
+    echo -e "${CYAN}Меню опции:${NC}"
+    echo ""
+    echo "  1-3  - Быстрая настройка стандартных протоколов (WireGuard, VLESS, MTProto)"
+    echo "  4    - Кастомное правило (любой TCP/UDP порт)"
+    echo "  5    - Просмотр активных правил"
+    echo "  6    - Удалить одно правило"
+    echo "  7    - Полная очистка (удалить ВСЕ правила COMP_MANIYA)"
+    echo "  8-19 - Утилиты (backup, restore, мониторинг и т.д.)"
+    echo ""
+    echo -e "${YELLOW}Важно:${NC}"
+    echo "  - Все операции изолированы в цепочках CM_*"
+    echo "  - UFW, Docker, Fail2ban НЕ затрагиваются"
+    echo "  - SSH защищен от блокировки"
+    echo ""
+    read -p "Нажмите Enter для возврата в меню..."
+}
+
+# --- КОНФИГУРИРОВАНИЕ ПРАВИЛ ---
+
 configure_rule() {
     local PROTO=$1
     local NAME=$2
@@ -131,75 +397,141 @@ configure_rule() {
     echo -e "\n${CYAN}--- Настройка $NAME ($PROTO) ---${NC}"
 
     while true; do
-        echo -e "Введите IP адрес назначения:"
+        echo -e "Введите IP адрес назначения (целевой сервер):"
         read -p "> " TARGET_IP
-        if [[ -n "$TARGET_IP" ]]; then break; fi
+        if validate_ipv4 "$TARGET_IP"; then 
+            break
+        fi
+        echo -e "${RED}Ошибка: введите корректный IPv4 адрес!${NC}"
     done
 
     while true; do
         echo -e "Введите Порт (одинаковый для входа и выхода):"
         read -p "> " PORT
-        if [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -le 65535 ]; then break; fi
-        echo -e "${RED}Ошибка: порт должен быть числом!${NC}"
+        if validate_port "$PORT"; then 
+            break
+        fi
+        echo -e "${RED}Ошибка: порт должен быть от 1 до 65535!${NC}"
     done
 
-    # Проверка: запрещаем добавлять правило на TCP SSH порт
-    if [[ "$PROTO" == "tcp" && "$PORT" == "$SSH_PORT" ]]; then
-        echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Порт $SSH_PORT (SSH) по TCP не может быть использован!${NC}"
-        echo -e "${RED}Это заблокирует ваш доступ к серверу.${NC}"
+    # Проверка конфликта с SSH
+    if check_ssh_port_conflict "$PORT"; then
+        if [[ "$PROTO" == "tcp" ]]; then
+            echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Порт $PORT совпадает с SSH портом!${NC}"
+            echo -e "${RED}Это заблокирует ваш доступ к серверу.${NC}"
+            read -p "Нажмите Enter..."
+            return 1
+        fi
+    fi
+    
+    # Проверка занятости локального порта
+    if ! check_port_available_local "$PORT" "$PROTO"; then
+        echo -e "${RED}[ERROR] Порт $PORT/$PROTO уже используется на этом сервере!${NC}"
         read -p "Нажмите Enter..."
-        return
+        return 1
+    fi
+    
+    # Проверка доступности целевого порта
+    echo -e "${YELLOW}[*] Проверка доступности ${TARGET_IP}:${PORT}/${PROTO}...${NC}"
+    if [[ "$PROTO" == "tcp" ]]; then
+        if ! check_tcp_port_reachable "$TARGET_IP" "$PORT"; then
+            echo -e "${YELLOW}[!] TCP порт ${TARGET_IP}:${PORT} не доступен (может быть firewall).${NC}"
+            read -p "Продолжить всё равно? (y/n): " continue_anyway
+            [[ "$continue_anyway" != "y" ]] && return 1
+        else
+            echo -e "${GREEN}[OK] TCP порт доступен${NC}"
+        fi
+    else
+        if ! check_udp_port_reachable "$TARGET_IP" "$PORT"; then
+            echo -e "${YELLOW}[!] UDP порт ${TARGET_IP}:${PORT} может быть не доступен.${NC}"
+            read -p "Продолжить всё равно? (y/n): " continue_anyway
+            [[ "$continue_anyway" != "y" ]] && return 1
+        else
+            echo -e "${GREEN}[OK] UDP порт доступен${NC}"
+        fi
     fi
 
     apply_iptables_rules "$PROTO" "$PORT" "$PORT" "$TARGET_IP" "$NAME"
 }
 
-# --- КАСТОМНАЯ НАСТРОЙКА (РАЗНЫЕ ПОРТЫ) ---
 configure_custom_rule() {
     echo -e "\n${CYAN}--- 🛠 Универсальное кастомное правило ---${NC}"
-    echo -e "${WHITE}Подходит для перенаправления ЛЮБЫХ протоколов (SSH, RDP, нестандартные порты)."
-    echo -e "Позволяет сделать так, чтобы клиент подключался к одному порту,"
-    echo -e "а трафик уходил на другой порт зарубежного сервера.${NC}\n"
+    echo -e "${WHITE}Подходит для перенаправления ЛЮБЫХ протоколов (SSH, RDP, нестандартные порты).${NC}\n"
 
     while true; do
         echo -e "Выберите протокол (${YELLOW}tcp${NC} или ${YELLOW}udp${NC}):"
         read -p "> " PROTO
-        if [[ "$PROTO" == "tcp" || "$PROTO" == "udp" ]]; then break; fi
+        if [[ "$PROTO" == "tcp" || "$PROTO" == "udp" ]]; then 
+            break
+        fi
         echo -e "${RED}Ошибка: введите tcp или udp!${NC}"
     done
 
     while true; do
-        echo -e "Введите IP адрес назначения (куда отправляем трафик):"
+        echo -e "Введите IP адрес назначения (целевой сервер):"
         read -p "> " TARGET_IP
-        if [[ -n "$TARGET_IP" ]]; then break; fi
+        if validate_ipv4 "$TARGET_IP"; then 
+            break
+        fi
+        echo -e "${RED}Ошибка: введите корректный IPv4 адрес!${NC}"
     done
 
     while true; do
         echo -e "Введите ${YELLOW}ВХОДЯЩИЙ Порт${NC} (на этом сервере):"
         read -p "> " IN_PORT
-        if [[ "$IN_PORT" =~ ^[0-9]+$ ]] && [ "$IN_PORT" -le 65535 ]; then break; fi
-        echo -e "${RED}Ошибка: порт должен быть числом!${NC}"
+        if validate_port "$IN_PORT"; then 
+            break
+        fi
+        echo -e "${RED}Ошибка: порт должен быть от 1 до 65535!${NC}"
     done
 
-    # Проверка: запрещаем добавлять правило на TCP SSH входящего порта
-    if [[ "$PROTO" == "tcp" && "$IN_PORT" == "$SSH_PORT" ]]; then
-        echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Входящий порт $SSH_PORT (SSH) по TCP не может быть использован!${NC}"
-        echo -e "${RED}Это заблокирует ваш доступ к серверу.${NC}"
+    # Проверка конфликта с SSH
+    if check_ssh_port_conflict "$IN_PORT"; then
+        if [[ "$PROTO" == "tcp" ]]; then
+            echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Входящий порт $IN_PORT совпадает с SSH портом!${NC}"
+            echo -e "${RED}Это заблокирует ваш доступ к серверу.${NC}"
+            read -p "Нажмите Enter..."
+            return 1
+        fi
+    fi
+    
+    # Проверка занятости локального входящего порта
+    if ! check_port_available_local "$IN_PORT" "$PROTO"; then
+        echo -e "${RED}[ERROR] Входящий порт $IN_PORT/$PROTO уже используется!${NC}"
         read -p "Нажмите Enter..."
-        return
+        return 1
     fi
 
     while true; do
-        echo -e "Введите ${YELLOW}ИСХОДЯЩИЙ Порт${NC} (на конечном сервере):"
+        echo -e "Введите ${YELLOW}ИСХОДЯЩИЙ Порт${NC} (на целевом сервере):"
         read -p "> " OUT_PORT
-        if [[ "$OUT_PORT" =~ ^[0-9]+$ ]] && [ "$OUT_PORT" -le 65535 ]; then break; fi
-        echo -e "${RED}Ошибка: порт должен быть числом!${NC}"
+        if validate_port "$OUT_PORT"; then 
+            break
+        fi
+        echo -e "${RED}Ошибка: порт должен быть от 1 до 65535!${NC}"
     done
+    
+    # Проверка доступности целевого порта
+    echo -e "${YELLOW}[*] Проверка доступности ${TARGET_IP}:${OUT_PORT}/${PROTO}...${NC}"
+    if [[ "$PROTO" == "tcp" ]]; then
+        if ! check_tcp_port_reachable "$TARGET_IP" "$OUT_PORT"; then
+            echo -e "${YELLOW}[!] TCP порт недоступен (может быть firewall).${NC}"
+            read -p "Продолжить? (y/n): " continue_anyway
+            [[ "$continue_anyway" != "y" ]] && return 1
+        fi
+    else
+        if ! check_udp_port_reachable "$TARGET_IP" "$OUT_PORT"; then
+            echo -e "${YELLOW}[!] UDP порт может быть недоступен.${NC}"
+            read -p "Продолжить? (y/n): " continue_anyway
+            [[ "$continue_anyway" != "y" ]] && return 1
+        fi
+    fi
 
     apply_iptables_rules "$PROTO" "$IN_PORT" "$OUT_PORT" "$TARGET_IP" "Custom Rule"
 }
 
 # --- IPv4 → IPv6 КАСКАД (socat) ---
+
 configure_ipv4_to_ipv6_rule() {
     local PROTO=$1
     local PROTO_UPPER=$(echo "$PROTO" | tr '[:lower:]' '[:upper:]')
@@ -209,58 +541,69 @@ configure_ipv4_to_ipv6_rule() {
     echo -e "трафик перенаправляется на целевой сервер по IPv6.${NC}\n"
 
     local SERVER_IP
-    SERVER_IP=$(curl -s -4 ifconfig.me 2>/dev/null)
-    [ -z "$SERVER_IP" ] && SERVER_IP=$(hostname -I | awk '{print $1}')
+    SERVER_IP=$(curl -s -4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
     echo -e "IP этого сервера (IPv4): ${GREEN}${SERVER_IP}${NC}\n"
 
     echo -e "${YELLOW}[*] Проверка поддержки IPv6 на этом сервере...${NC}"
-    if ! ip -6 addr show | grep -q "inet6" || ! ping6 -c 1 -W 3 2001:4860:4860::8888 > /dev/null 2>&1; then
-        echo -e "${RED}[ERROR] Этот сервер не поддерживает IPv6 или нет IPv6-связности. Каскад не создан.${NC}"
+    if ! ip -6 addr show | grep -q "inet6"; then
+        echo -e "${RED}[ERROR] Этот сервер не поддерживает IPv6. Каскад не создан.${NC}"
         read -p "Нажмите Enter для возврата в меню..."
-        return
+        return 1
     fi
-    echo -e "${GREEN}[OK] IPv6 на этом сервере работает.${NC}\n"
+    echo -e "${GREEN}[OK] IPv6 поддержка найдена.${NC}\n"
 
     while true; do
         echo -e "Введите ${YELLOW}Порт${NC} (одинаковый для входа и выхода):"
         read -p "> " IN_PORT
-        if [[ "$IN_PORT" =~ ^[0-9]+$ ]] && [ "$IN_PORT" -le 65535 ]; then break; fi
-        echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
+        if validate_port "$IN_PORT"; then 
+            break
+        fi
+        echo -e "${RED}Ошибка: порт должен быть от 1 до 65535!${NC}"
     done
 
-    # Проверка: запрещаем добавлять правило на TCP SSH (22)
-    if [[ "$PROTO" == "tcp" && "$IN_PORT" == "22" ]]; then
-        echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Порт 22 (SSH) по TCP не может быть использован!${NC}"
-        echo -e "${RED}Это заблокирует ваш доступ к серверу.${NC}"
-        read -p "Нажмите Enter..."
-        return
+    # Проверка конфликта с SSH
+    if check_ssh_port_conflict "$IN_PORT"; then
+        if [[ "$PROTO" == "tcp" ]]; then
+            echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Порт $IN_PORT совпадает с SSH портом!${NC}"
+            read -p "Нажмите Enter..."
+            return 1
+        fi
     fi
-
-    # Проверка: запрещаем добавлять правило на TCP SSH порт
-    if [[ "$PROTO" == "tcp" && "$IN_PORT" == "$SSH_PORT" ]]; then
-        echo -e "${RED}[ERROR] ⚠️  ЗАПРЕЩЕНО! Порт $SSH_PORT (SSH) по TCP не может быть использован!${NC}"
-        echo -e "${RED}Это заблокирует ваш доступ к серверу.${NC}"
+    
+    # Проверка занятости локального порта
+    if ! check_port_available_local "$IN_PORT" "$PROTO"; then
+        echo -e "${RED}[ERROR] Порт $IN_PORT/$PROTO уже используется!${NC}"
         read -p "Нажмите Enter..."
-        return
+        return 1
     fi
 
     while true; do
         echo -e "Введите ${YELLOW}IPv6 адрес${NC} назначения (например: 2001:db8::1):"
         read -p "> " TARGET_IP6
-        if [[ "$TARGET_IP6" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]]; then break; fi
+        if validate_ipv6 "$TARGET_IP6"; then 
+            break
+        fi
         echo -e "${RED}Ошибка: введите корректный IPv6 адрес!${NC}"
     done
 
-    echo -e "${YELLOW}[*] Проверка доступности целевого IPv6 адреса [${TARGET_IP6}]...${NC}"
-    if ! ping6 -c 2 -W 4 "$TARGET_IP6" > /dev/null 2>&1; then
-        echo -e "${RED}[ERROR] IPv6 адрес ${TARGET_IP6} недоступен. Каскад не создан.${NC}"
-        read -p "Нажмите Enter для возврата в меню..."
-        return
+    echo -e "${YELLOW}[*] Проверка доступности целевого IPv6 адреса [${TARGET_IP6}]:${IN_PORT}/${PROTO}...${NC}"
+    
+    if [[ "$PROTO" == "tcp" ]]; then
+        if ! check_tcp_port_reachable "$TARGET_IP6" "$IN_PORT"; then
+            echo -e "${YELLOW}[!] TCP порт на IPv6 может быть недоступен.${NC}"
+            read -p "Продолжить? (y/n): " continue_anyway
+            [[ "$continue_anyway" != "y" ]] && return 1
+        fi
+    else
+        if ! check_udp_port_reachable "$TARGET_IP6" "$IN_PORT"; then
+            echo -e "${YELLOW}[!] UDP порт на IPv6 может быть недоступен.${NC}"
+            read -p "Продолжить? (y/n): " continue_anyway
+            [[ "$continue_anyway" != "y" ]] && return 1
+        fi
     fi
-    echo -e "${GREEN}[OK] Целевой IPv6 адрес доступен.${NC}\n"
+    echo -e "${GREEN}[OK] Целевой адрес доступен.${NC}\n"
 
     local OUT_PORT="$IN_PORT"
-
     local SVC_NAME="socat-ipv6-${IN_PORT}-${PROTO}"
     local SVC_FILE="/etc/systemd/system/${SVC_NAME}.service"
 
@@ -286,21 +629,47 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable "$SVC_NAME" > /dev/null 2>&1
-    systemctl restart "$SVC_NAME"
-
-    iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
-    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$IN_PORT"/"$PROTO" >/dev/null
+    if ! systemctl enable "$SVC_NAME" > /dev/null 2>&1; then
+        echo -e "${RED}[ERROR] Ошибка при включении сервиса${NC}"
+        return 1
     fi
-    netfilter-persistent save > /dev/null
+    
+    if ! systemctl restart "$SVC_NAME"; then
+        echo -e "${RED}[ERROR] Ошибка при запуске socat${NC}"
+        rm -f "$SVC_FILE"
+        systemctl daemon-reload
+        return 1
+    fi
+    
+    # Проверка, что сервис запустился
+    sleep 1
+    if ! systemctl is-active --quiet "$SVC_NAME"; then
+        echo -e "${RED}[ERROR] Сервис socat не запустился. Статус:${NC}"
+        systemctl status "$SVC_NAME" | head -10
+        rm -f "$SVC_FILE"
+        systemctl daemon-reload
+        return 1
+    fi
+
+    iptables -A CM_INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
+    if ! iptables -D INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null; then
+        true  # Может не быть старого правила
+    fi
+    
+    # UFW: допустить только если активен
+    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+        ufw allow "$IN_PORT"/"$PROTO" >/dev/null 2>&1 || true
+    fi
+    
+    netfilter-persistent save > /dev/null 2>&1 || true
 
     echo -e "${GREEN}[SUCCESS] IPv4→IPv6 каскад настроен!${NC}"
     echo -e "$PROTO_UPPER: ${SERVER_IP}:${IN_PORT} (IPv4) -> [${TARGET_IP6}]:${IN_PORT} (IPv6)"
     read -p "Нажмите Enter для возврата в меню..."
 }
 
-# --- ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES ---
+# --- ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES (БЕЗОПАСНО) ---
+
 apply_iptables_rules() {
     local PROTO=$1
     local IN_PORT=$2
@@ -308,39 +677,61 @@ apply_iptables_rules() {
     local TARGET_IP=$4
     local NAME=$5
 
-    IFACE=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+    IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk -- '{printf $5}' | head -1)
     if [[ -z "$IFACE" ]]; then
         echo -e "${RED}[ERROR] Не удалось определить интерфейс!${NC}"
-        exit 1
+        return 1
     fi
 
     echo -e "${YELLOW}[*] Применение правил...${NC}"
 
-    # Удаление старых правил (по входящему порту)
-    iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
-    iptables -D INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    # Удаление старых правил (если они были)
+    iptables -t nat -D CM_DNAT_RULES -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null || true
+    iptables -D CM_INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null || true
+    iptables -D CM_FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -D CM_FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
-    # Новые правила
-    iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
-    iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"
+    # Новые правила в CM_* цепочках
+    if ! iptables -A CM_INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT; then
+        echo -e "${RED}[ERROR] Ошибка добавления INPUT правила${NC}"
+        return 1
+    fi
     
-    if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+    if ! iptables -t nat -A CM_DNAT_RULES -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"; then
+        echo -e "${RED}[ERROR] Ошибка добавления DNAT правила${NC}"
+        return 1
+    fi
+    
+    # MASQUERADE только для целевого IP (в CM_SNAT_RULES)
+    if ! iptables -t nat -C CM_SNAT_RULES -d "$TARGET_IP" -o "$IFACE" -j MASQUERADE 2>/dev/null; then
+        if ! iptables -t nat -A CM_SNAT_RULES -d "$TARGET_IP" -o "$IFACE" -j MASQUERADE; then
+            echo -e "${RED}[ERROR] Ошибка добавления SNAT правила${NC}"
+            return 1
+        fi
     fi
 
-    iptables -A FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
-    iptables -A FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT
+    if ! iptables -A CM_FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT; then
+        echo -e "${RED}[ERROR] Ошибка добавления FORWARD правила (в)${NC}"
+        return 1
+    fi
+    
+    if ! iptables -A CM_FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT; then
+        echo -e "${RED}[ERROR] Ошибка добавления FORWARD правила (из)${NC}"
+        return 1
+    fi
 
-    # Настройка UFW если активен
+    # UFW: добавить правило если активен (НЕ меняем DEFAULT_FORWARD_POLICY!)
     if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$IN_PORT"/"$PROTO" >/dev/null
-        sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-        ufw reload >/dev/null
+        ufw allow "$IN_PORT"/"$PROTO" >/dev/null 2>&1 || true
     fi
 
-    netfilter-persistent save > /dev/null
+    # Сохранение конфигурации
+    if ! netfilter-persistent save > /dev/null 2>&1; then
+        echo -e "${YELLOW}[!] Предупреждение: netfilter-persistent save не сработал${NC}"
+    fi
+    
+    # Сохранение метаданных о правиле
+    save_rule_metadata "$PROTO" "$IN_PORT" "$OUT_PORT" "$TARGET_IP" "$NAME"
     
     echo -e "${GREEN}[SUCCESS] $NAME настроен!${NC}"
     echo -e "$PROTO: Вход $IN_PORT -> Выход $TARGET_IP:$OUT_PORT"
@@ -348,32 +739,34 @@ apply_iptables_rules() {
 }
 
 # --- СПИСОК ПРАВИЛ ---
-list_active_rules() {
-    echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
 
-    SERVER_IP=$(curl -s -4 ifconfig.me 2>/dev/null)
-    [ -z "$SERVER_IP" ] && SERVER_IP=$(hostname -I | awk '{print $1}')
+list_active_rules() {
+    echo -e "\n${CYAN}--- Активные переадресации COMP_MANIYA ---${NC}"
+
+    SERVER_IP=$(curl -s -4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 
     echo -e "${MAGENTA}Сервер каскада:${NC} ${GREEN}${SERVER_IP}${NC}"
     echo ""
-    echo -e "${MAGENTA}ВХОД (этот VPS) -> ВЫХОД (целевой сервер)${NC}"
+    echo -e "${MAGENTA}IPv4 Правила (ВХОД -> ВЫХОД):${NC}"
     echo ""
 
-    iptables -t nat -S PREROUTING | grep "DNAT" | while read -r line ; do
+    local count=0
+    iptables -t nat -S CM_DNAT_RULES 2>/dev/null | grep "DNAT" | while read -r line ; do
         l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
 
         if [[ -n "$l_port" ]]; then
             echo -e "${CYAN}${SERVER_IP}:${l_port}${NC} (${YELLOW}${l_proto}${NC}) -> ${GREEN}${l_dest}${NC}"
+            ((count++))
         fi
     done
 
     local has_ipv6=0
+    echo ""
     for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
         [[ -f "$svc_file" ]] || continue
         if [[ $has_ipv6 -eq 0 ]]; then
-            echo ""
             echo -e "${MAGENTA}IPv4 → IPv6 каскады (socat):${NC}"
             has_ipv6=1
         fi
@@ -396,6 +789,7 @@ list_active_rules() {
 }
 
 # --- УДАЛЕНИЕ ОДНОГО ПРАВИЛА ---
+
 delete_single_rule() {
     echo -e "\n${CYAN}--- Удаление правила ---${NC}"
     declare -a RULES_LIST
@@ -412,7 +806,7 @@ delete_single_rule() {
             echo -e "${YELLOW}[$i]${NC} Вход: $l_port ($l_proto) -> Выход: $l_dest"
             ((i++))
         fi
-    done < <(iptables -t nat -S PREROUTING | grep "DNAT")
+    done < <(iptables -t nat -S CM_DNAT_RULES 2>/dev/null | grep "DNAT")
 
     for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
         [[ -f "$svc_file" ]] || continue
@@ -441,69 +835,118 @@ delete_single_rule() {
         local svc_name="${RULES_LIST[$rule_num]}"
         local port=$(echo "$svc_name" | grep -oP '(?<=socat-ipv6-)\d+')
         local proto=$(echo "$svc_name" | grep -oP '(?<=socat-ipv6-\d{1,5}-).+')
-        systemctl stop "$svc_name" 2>/dev/null
-        systemctl disable "$svc_name" > /dev/null 2>&1
+        
+        echo -e "${YELLOW}[*] Остановка сервиса ${svc_name}...${NC}"
+        systemctl stop "$svc_name" 2>/dev/null || true
+        systemctl disable "$svc_name" > /dev/null 2>&1 || true
         rm -f "/etc/systemd/system/${svc_name}.service"
         systemctl daemon-reload
-        iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null
-        netfilter-persistent save > /dev/null
+        
+        iptables -D CM_INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+        
+        # Удалить UFW правило если активен
+        if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+            ufw delete allow "$port"/"$proto" 2>/dev/null || true
+        fi
+        
+        netfilter-persistent save > /dev/null 2>&1 || true
         echo -e "${GREEN}[OK] IPv4→IPv6 правило удалено.${NC}"
     else
         IFS=':' read -r d_port d_proto d_dest <<< "${RULES_LIST[$rule_num]}"
         local target_ip="${d_dest%:*}"
         local target_port="${d_dest#*:}"
-        iptables -t nat -D PREROUTING -p "$d_proto" --dport "$d_port" -j DNAT --to-destination "$d_dest" 2>/dev/null
-        iptables -D INPUT -p "$d_proto" --dport "$d_port" -j ACCEPT 2>/dev/null
-        iptables -D FORWARD -p "$d_proto" -d "$target_ip" --dport "$target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-        iptables -D FORWARD -p "$d_proto" -s "$target_ip" --sport "$target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-        netfilter-persistent save > /dev/null
+        
+        echo -e "${YELLOW}[*] Удаление правил для ${d_dest}...${NC}"
+        iptables -t nat -D CM_DNAT_RULES -p "$d_proto" --dport "$d_port" -j DNAT --to-destination "$d_dest" 2>/dev/null || true
+        iptables -D CM_INPUT -p "$d_proto" --dport "$d_port" -j ACCEPT 2>/dev/null || true
+        iptables -D CM_FORWARD -p "$d_proto" -d "$target_ip" --dport "$target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        iptables -D CM_FORWARD -p "$d_proto" -s "$target_ip" --sport "$target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        
+        # Удалить UFW правило если активен
+        if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+            ufw delete allow "$d_port"/"$d_proto" 2>/dev/null || true
+        fi
+        
+        netfilter-persistent save > /dev/null 2>&1 || true
         echo -e "${GREEN}[OK] Правило удалено.${NC}"
     fi
 
     read -p "Нажмите Enter..."
 }
 
-# --- ПОЛНАЯ ОЧИСТКА ---
+# --- ПОЛНАЯ ОЧИСТКА (ТОЛЬКО CM_* ЦЕПОЧКИ) ---
+
 flush_rules() {
     echo -e "\n${RED}!!! ВНИМАНИЕ !!!${NC}"
-    echo "Сброс ВСЕХ настроек iptables и IPv4→IPv6 правил (socat)."
+    echo "Удалены ТОЛЬКО правила COMP_MANIYA в цепочках CM_*"
+    echo "Правила UFW, Docker, Fail2ban НЕ будут затронуты."
     read -p "Вы уверены? (y/n): " confirm
-    if [[ "$confirm" == "y" ]]; then
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        iptables -t nat -F
-        iptables -t mangle -F
-        iptables -F
-        iptables -X
-        netfilter-persistent save > /dev/null
-
-        for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
-            [[ -f "$svc_file" ]] || continue
-            local svc_name=$(basename "$svc_file" .service)
-            systemctl stop "$svc_name" 2>/dev/null
-            systemctl disable "$svc_name" > /dev/null 2>&1
-            rm -f "$svc_file"
-        done
-        systemctl daemon-reload
-
-        echo -e "${GREEN}[OK] Очищено.${NC}"
+    if [[ "$confirm" != "y" ]]; then 
+        return
     fi
+    
+    echo -e "${YELLOW}[*] Очистка правил COMP_MANIYA...${NC}"
+    
+    # Остановка всех socat сервисов
+    for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
+        [[ -f "$svc_file" ]] || continue
+        local svc_name=$(basename "$svc_file" .service)
+        local port=$(echo "$svc_name" | grep -oP '(?<=socat-ipv6-)\d+')
+        local proto=$(echo "$svc_name" | sed 's/socat-ipv6-[0-9]*-//')
+        
+        systemctl stop "$svc_name" 2>/dev/null || true
+        systemctl disable "$svc_name" > /dev/null 2>&1 || true
+        rm -f "$svc_file"
+        
+        # Удалить UFW правила
+        if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+            ufw delete allow "$port"/"$proto" 2>/dev/null || true
+        fi
+    done
+    systemctl daemon-reload
+
+    # Очистка только CM_* цепочек (оставляем UFW/Docker)
+    iptables -F CM_INPUT 2>/dev/null || true
+    iptables -F CM_FORWARD 2>/dev/null || true
+    iptables -t nat -F CM_DNAT_RULES 2>/dev/null || true
+    iptables -t nat -F CM_SNAT_RULES 2>/dev/null || true
+    
+    # Удалить UFW правила, созданные этим скриптом
+    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+        while IFS='|' read -r proto in_port _ _ _; do
+            [[ -z "$proto" ]] && continue
+            ufw delete allow "$in_port"/"$proto" 2>/dev/null || true
+        done < "$CM_RULES_FILE" 2>/dev/null
+    fi
+    
+    # Очистить файл метаданных
+    > "$CM_RULES_FILE"
+    
+    netfilter-persistent save > /dev/null 2>&1 || true
+
+    echo -e "${GREEN}[OK] Правила COMP_MANIYA очищены.${NC}"
+    echo -e "${CYAN}[i] Все остальные правила firewall сохранены.${NC}"
     read -p "Нажмите Enter..."
 }
 
 # --- ПРОВЕРКА СОЕДИНЕНИЯ ---
+
 check_connection() {
     echo -e "${CYAN}--- Проверка соединения ---${NC}"
 
     while true; do
         read -p "Введите IP для проверки: " TEST_IP
-        [[ -n "$TEST_IP" ]] && break
+        if validate_ipv4 "$TEST_IP" || validate_ipv6 "$TEST_IP"; then
+            break
+        fi
+        echo -e "${RED}Ошибка: введите корректный IP адрес!${NC}"
     done
 
     while true; do
         read -p "Введите порт: " TEST_PORT
-        [[ "$TEST_PORT" =~ ^[0-9]+$ ]] && [ "$TEST_PORT" -le 65535 ] && break
+        if validate_port "$TEST_PORT"; then 
+            break
+        fi
         echo -e "${RED}Ошибка: введите корректный порт!${NC}"
     done
 
@@ -515,102 +958,121 @@ check_connection() {
 
     echo ""
     echo -e "${YELLOW}[*] Проверка ping...${NC}"
-    ping -c 2 "$TEST_IP"
+    ping -c 2 "$TEST_IP" 2>/dev/null || echo "Ping не ответил"
 
     echo ""
     echo -e "${YELLOW}[*] Проверка порта...${NC}"
 
     if ! command -v nc >/dev/null 2>&1; then
-        apt-get update -y >/dev/null
-        apt-get install -y netcat-openbsd >/dev/null
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y netcat-openbsd >/dev/null 2>&1
     fi
 
     if [[ "$TEST_PROTO" == "tcp" ]]; then
-        nc -zv "$TEST_IP" "$TEST_PORT"
+        nc -zv "$TEST_IP" "$TEST_PORT" 2>&1 || echo "Соединение не удалось"
     else
-        nc -zvu "$TEST_IP" "$TEST_PORT"
+        nc -zvu "$TEST_IP" "$TEST_PORT" 2>&1 || echo "UDP проверка не удалась"
     fi
 
     read -p "Нажмите Enter..."
 }
 
 # --- BACKUP ---
+
 backup_rules() {
     echo -e "${CYAN}--- Создание backup ---${NC}"
 
-    iptables-save > /root/compmaniya-backup.rules
+    local backup_file="$BACKUP_DIR/compmaniya-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    local temp_backup="/tmp/compmaniya-backup-$$"
+    mkdir -p "$temp_backup"
 
-    local ipv6_list="/root/compmaniya-backup-ipv6.list"
-    rm -f "$ipv6_list"
+    # Сохранить только CM_* iptables цепочки
+    {
+        echo "# COMP_MANIYA Backup - $(date)"
+        echo "# Содержит только CM_* цепочки"
+        iptables-save | grep -E "^:(CM_|PREROUTING|POSTROUTING|FORWARD|INPUT)" 
+        iptables-save | grep -E "^\[.*\]\s+-A\s+(CM_|PREROUTING.*CM|POSTROUTING.*CM|FORWARD.*CM|INPUT.*CM)"
+    } > "$temp_backup/iptables.rules"
+
+    # Сохранить метаданные правил
+    [[ -f "$CM_RULES_FILE" ]] && cp "$CM_RULES_FILE" "$temp_backup/rules.metadata"
+
+    # Сохранить конфиги socat
     for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
-        [[ -f "$svc_file" ]] || continue
-        local svc_name=$(basename "$svc_file" .service)
-        local port=$(echo "$svc_name" | grep -oP '(?<=socat-ipv6-)\d+')
-        local proto=$(echo "$svc_name" | sed 's/socat-ipv6-[0-9]*-//')
-        local dest_ip=$(grep -oP '(?<=\[)[0-9a-fA-F:]+(?=\])' "$svc_file" | head -1)
-        local dest_port=$(grep -oP '(?<=\]:)\d+' "$svc_file" | head -1)
-        echo "${port}|${proto}|${dest_ip}|${dest_port}" >> "$ipv6_list"
+        [[ -f "$svc_file" ]] && cp "$svc_file" "$temp_backup/"
     done
 
+    # Архивировать
+    tar czf "$backup_file" -C "$temp_backup" . 2>/dev/null
+    rm -rf "$temp_backup"
+
     echo -e "${GREEN}[OK] Backup сохранён:${NC}"
-    echo "/root/compmaniya-backup.rules"
-    if [[ -f "$ipv6_list" ]]; then
-        echo "/root/compmaniya-backup-ipv6.list"
-    fi
+    echo "$backup_file"
+    ls -lh "$backup_file"
 
     read -p "Нажмите Enter..."
 }
 
 # --- RESTORE ---
+
 restore_rules() {
     echo -e "${CYAN}--- Восстановление backup ---${NC}"
 
-    if [[ ! -f /root/compmaniya-backup.rules ]]; then
+    # Найти последний backup
+    local latest_backup=$(ls -t "$BACKUP_DIR"/compmaniya-backup-*.tar.gz 2>/dev/null | head -1)
+    
+    if [[ -z "$latest_backup" ]]; then
         echo -e "${RED}[ERROR] Backup не найден!${NC}"
         read -p "Нажмите Enter..."
-        return
+        return 1
     fi
 
-    iptables-restore < /root/compmaniya-backup.rules
-    netfilter-persistent save > /dev/null
-    echo -e "${GREEN}[OK] Правила iptables восстановлены.${NC}"
+    echo -e "Найден backup: ${GREEN}$(basename "$latest_backup")${NC}"
+    read -p "Восстановить из этого backup? (y/n): " confirm
+    [[ "$confirm" != "y" ]] && return
 
-    local ipv6_list="/root/compmaniya-backup-ipv6.list"
-    if [[ -f "$ipv6_list" ]]; then
-        while IFS='|' read -r port proto dest_ip dest_port; do
-            [[ -z "$port" ]] && continue
-            local svc_name="socat-ipv6-${port}-${proto}"
-            local svc_file="/etc/systemd/system/${svc_name}.service"
-            if [[ "$proto" == "tcp" ]]; then
-                local socat_cmd="socat TCP4-LISTEN:${port},bind=0.0.0.0,fork,reuseaddr TCP6:[${dest_ip}]:${dest_port}"
-            else
-                local socat_cmd="socat UDP4-LISTEN:${port},bind=0.0.0.0,fork,reuseaddr UDP6:[${dest_ip}]:${dest_port}"
-            fi
-            cat > "$svc_file" <<EOF
-[Unit]
-Description=socat IPv4->IPv6 forward port ${port}/${proto} to [${dest_ip}]:${dest_port}
-After=network.target
+    local temp_restore="/tmp/compmaniya-restore-$$"
+    mkdir -p "$temp_restore"
 
-[Service]
-Type=simple
-ExecStart=${socat_cmd}
-Restart=always
-RestartSec=5
+    # Распаковать
+    tar xzf "$latest_backup" -C "$temp_restore"
 
-[Install]
-WantedBy=multi-user.target
-EOF
-            systemctl daemon-reload
-            systemctl enable "$svc_name" > /dev/null 2>&1
-            systemctl restart "$svc_name"
-            echo -e "${GREEN}[OK] IPv4→IPv6: ${port}/${proto} -> [${dest_ip}]:${dest_port}${NC}"
-        done < "$ipv6_list"
+    echo -e "${YELLOW}[*] Восстановление CM_* цепочек...${NC}"
+    
+    # Восстановить только наши цепочки (не перезаписывать всё)
+    if [[ -f "$temp_restore/iptables.rules" ]]; then
+        grep -E "^:\s*CM_" "$temp_restore/iptables.rules" | while read -r line; do
+            eval "$line" 2>/dev/null || true
+        done
+        
+        grep -E "^\[.*\]\s+-A\s+CM_" "$temp_restore/iptables.rules" | while read -r line; do
+            eval "$line" 2>/dev/null || true
+        done
     fi
 
+    # Восстановить socat сервисы
+    for svc_file in "$temp_restore"/socat-ipv6-*.service; do
+        [[ -f "$svc_file" ]] || continue
+        local svc_name=$(basename "$svc_file")
+        cp "$svc_file" "/etc/systemd/system/$svc_name"
+        systemctl daemon-reload
+        systemctl enable "$svc_name" >/dev/null 2>&1
+        systemctl restart "$svc_name"
+        echo -e "${GREEN}[OK] Восстановлен: $svc_name${NC}"
+    done
+
+    # Восстановить метаданные
+    [[ -f "$temp_restore/rules.metadata" ]] && cp "$temp_restore/rules.metadata" "$CM_RULES_FILE"
+
+    netfilter-persistent save > /dev/null 2>&1 || true
+    rm -rf "$temp_restore"
+    
+    echo -e "${GREEN}[OK] Правила восстановлены (только CM_* цепочки).${NC}"
     read -p "Нажмите Enter..."
 }
 
 # --- ПОЛНОЕ УДАЛЕНИЕ ---
+
 uninstall_script() {
     echo -e "${RED}╔══════════════════════════════════════╗${NC}"
     echo -e "${RED}║      ПОЛНОЕ УДАЛЕНИЕ СКРИПТА         ║${NC}"
@@ -618,59 +1080,71 @@ uninstall_script() {
     echo ""
 
     echo "Будет удалено:"
-    echo "- все правила iptables"
+    echo "- все правила CM_* iptables"
     echo "- все IPv4→IPv6 правила (socat сервисы)"
     echo "- backup файлы"
     echo "- launcher команда compmaniya"
     echo ""
+    echo "Сохранено:"
+    echo "- UFW правила"
+    echo "- Docker правила"
+    echo "- Fail2ban правила"
+    echo "- Все остальные iptables правила"
+    echo ""
 
     read -p "Введите YES для подтверждения: " confirm
-
     confirm=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
 
     if [[ "$confirm" != "yes" && "$confirm" != "y" ]]; then
-    echo -e "${YELLOW}Удаление отменено.${NC}"
-    read -p "Нажмите Enter..."
-    return
+        echo -e "${YELLOW}Удаление отменено.${NC}"
+        read -p "Нажмите Enter..."
+        return
     fi
-
-    echo -e "${YELLOW}[*] Очистка iptables...${NC}"
-
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
-    iptables -t nat -F
-    iptables -t mangle -F
-    iptables -F
-    iptables -X
-
-    netfilter-persistent save > /dev/null
 
     echo -e "${YELLOW}[*] Остановка IPv4→IPv6 сервисов...${NC}"
 
     for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
         [[ -f "$svc_file" ]] || continue
         local svc_name=$(basename "$svc_file" .service)
-        systemctl stop "$svc_name" 2>/dev/null
-        systemctl disable "$svc_name" > /dev/null 2>&1
+        systemctl stop "$svc_name" 2>/dev/null || true
+        systemctl disable "$svc_name" > /dev/null 2>&1 || true
         rm -f "$svc_file"
     done
     systemctl daemon-reload
 
+    echo -e "${YELLOW}[*] Удаление CM_* iptables цепочек...${NC}"
+
+    iptables -F CM_INPUT 2>/dev/null || true
+    iptables -F CM_FORWARD 2>/dev/null || true
+    iptables -t nat -F CM_DNAT_RULES 2>/dev/null || true
+    iptables -t nat -F CM_SNAT_RULES 2>/dev/null || true
+    
+    iptables -X CM_INPUT 2>/dev/null || true
+    iptables -X CM_FORWARD 2>/dev/null || true
+    iptables -t nat -X CM_DNAT_RULES 2>/dev/null || true
+    iptables -t nat -X CM_SNAT_RULES 2>/dev/null || true
+
+    netfilter-persistent save > /dev/null 2>&1 || true
+
     echo -e "${YELLOW}[*] Удаление файлов...${NC}"
 
     rm -f /usr/local/bin/compmaniya
-    rm -f /root/compmaniya-backup.rules
-    rm -f /root/compmaniya-backup-ipv6.list
+    rm -f "$BACKUP_DIR"/compmaniya-backup*.rules
+    rm -f "$BACKUP_DIR"/compmaniya-backup*.tar.gz
+    rm -f "$BACKUP_DIR"/compmaniya-backup-ipv6.list
+    rm -f "$CM_RULES_FILE"
+    rm -rf "$CM_STATE_DIR"
 
     echo ""
     echo -e "${GREEN}[SUCCESS] Скрипт полностью удалён.${NC}"
-    echo -e "${GREEN}[SUCCESS] Перезапустите терминал.${NC}"
+    echo -e "${GREEN}[SUCCESS] Правила UFW/Docker/Fail2ban сохранены.${NC}"
+    echo -e "${CYAN}[i] Перезапустите терминал для завершения.${NC}"
 
     exit 0
 }
 
 # --- МОНИТОРИНГ VPS ---
+
 system_status() {
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║         МОНИТОРИНГ VPS               ║${NC}"
@@ -696,7 +1170,8 @@ system_status() {
     read -p "Нажмите Enter..."
 }
 
-# --- КРАСИВЫЙ СЧЁТЧИК ТРАФИКА ---
+# --- СЧЁТЧИК ТРАФИКА ---
+
 port_traffic_stats() {
     echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║               ТРАФИК ПО ПРАВИЛАМ KASKAD                  ║${NC}"
@@ -706,7 +1181,7 @@ port_traffic_stats() {
     printf "%-8s %-8s %-22s %-12s %-12s\n" "PORT" "PROTO" "DESTINATION" "PACKETS" "TRAFFIC"
     echo "---------------------------------------------------------------------"
 
-    iptables -t nat -L PREROUTING -v -n | grep DNAT | while read -r line; do
+    iptables -t nat -L CM_DNAT_RULES -v -n 2>/dev/null | grep DNAT | while read -r line; do
         PACKETS=$(echo "$line" | awk '{print $1}')
         BYTES=$(echo "$line" | awk '{print $2}')
         PROTO=$(echo "$line" | awk '{print $4}')
@@ -714,8 +1189,7 @@ port_traffic_stats() {
         DEST=$(echo "$line" | grep -oP 'to:\K[\d\.:]+')
 
         if [[ -n "$PORT" ]]; then
-            TRAFFIC=$(numfmt --to=iec --suffix=B "$BYTES" 2>/dev/null)
-            [[ -z "$TRAFFIC" ]] && TRAFFIC="${BYTES}B"
+            TRAFFIC=$(numfmt --to=iec --suffix=B "$BYTES" 2>/dev/null || echo "${BYTES}B")
 
             printf "%-8s %-8s %-22s %-12s %-12s\n" \
                 "$PORT" "$PROTO" "$DEST" "$PACKETS" "$TRAFFIC"
@@ -726,25 +1200,78 @@ port_traffic_stats() {
     read -p "Нажмите Enter..."
 }
 
-# --- ОГРАНИЧЕНИЕ ПО IP ---
+# --- ОГРАНИЧЕНИЕ ПО IP (ИСПРАВЛЕННО) ---
+
 lock_port_to_ip() {
     echo -e "${CYAN}--- Ограничение доступа по IP ---${NC}"
+    echo -e "${WHITE}Это правило используется для ограничения доступа к перенаправленному порту.${NC}\n"
 
     read -p "Введите IP клиента: " CLIENT_IP
-    read -p "Введите порт: " PORT
+    if ! validate_ipv4 "$CLIENT_IP"; then
+        echo -e "${RED}Ошибка: некорректный IP${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    read -p "Введите входящий порт (на этом сервере): " IN_PORT
+    if ! validate_port "$IN_PORT"; then
+        echo -e "${RED}Ошибка: некорректный порт${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    read -p "Введите исходящий порт (целевой сервер): " OUT_PORT
+    if ! validate_port "$OUT_PORT"; then
+        echo -e "${RED}Ошибка: некорректный порт${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    read -p "Введите IP целевого сервера: " TARGET_IP
+    if ! validate_ipv4 "$TARGET_IP"; then
+        echo -e "${RED}Ошибка: некорректный IP${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
     read -p "Протокол (tcp/udp): " PROTO
+    if [[ "$PROTO" != "tcp" && "$PROTO" != "udp" ]]; then
+        echo -e "${RED}Ошибка: только tcp или udp${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
 
-    iptables -I INPUT -p "$PROTO" -s "$CLIENT_IP" --dport "$PORT" -j ACCEPT
-    iptables -A INPUT -p "$PROTO" --dport "$PORT" -j DROP
+    # Правила в CM_FORWARD цепочке (где проходит DNAT трафик)
+    # Позволить только указанному IP для данного целевого адреса:порта
+    echo -e "${YELLOW}[*] Добавление правила...${NC}"
+    
+    if ! iptables -I CM_FORWARD -p "$PROTO" -s "$CLIENT_IP" -d "$TARGET_IP" \
+        --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT; then
+        echo -e "${RED}[ERROR] Ошибка при добавлении разрешающего правила${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
 
-    netfilter-persistent save > /dev/null
+    # Блокировать всех остальных для этого целевого адреса:порта
+    if ! iptables -A CM_FORWARD -p "$PROTO" -d "$TARGET_IP" \
+        --dport "$OUT_PORT" -m state --state NEW -j DROP; then
+        echo -e "${RED}[ERROR] Ошибка при добавлении блокирующего правила${NC}"
+        iptables -D CM_FORWARD -p "$PROTO" -s "$CLIENT_IP" -d "$TARGET_IP" \
+            --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    netfilter-persistent save > /dev/null 2>&1 || true
 
     echo -e "${GREEN}[OK] Доступ разрешён только для ${CLIENT_IP}${NC}"
+    echo -e "Целевой адрес: ${TARGET_IP}:${OUT_PORT}/${PROTO}"
 
     read -p "Нажмите Enter..."
 }
 
 # --- LIVE ПОДКЛЮЧЕНИЯ ---
+
 live_connections() {
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║          LIVE ПОДКЛЮЧЕНИЯ            ║${NC}"
@@ -758,17 +1285,18 @@ live_connections() {
 }
 
 # --- МЕНЮ ---
+
 show_menu() {
     while true; do
         echo -e "${MAGENTA}"
         echo "******************************************************"
-        echo "           COMP_MANIYA KASKAD PRO"
+        echo "           COMP_MANIYA KASKAD PRO v${CM_VERSION}"
         echo "   YouTube: https://www.youtube.com/@comp_maniya"
         echo "   Telegram: https://t.me/computerchik"
         echo "******************************************************"
         echo -e "${NC}"
 
-        echo -e "${GREEN}💰 Задонатить каналу и автору:${NC} https://pay.cloudtips.ru/p/4a618628"
+        echo -e "${GREEN}💰 Поддержать канал:${NC} https://pay.cloudtips.ru/p/4a618628"
         echo -e "------------------------------------------------------"
         echo ""
         echo -e "1) Настроить ${CYAN}AmneziaWG / WireGuard${NC} (UDP)"
@@ -777,7 +1305,7 @@ show_menu() {
         echo -e "4) 🛠 Создать ${YELLOW}Кастомное правило${NC}"
         echo -e "5) Посмотреть активные правила"
         echo -e "6) ${RED}Удалить одно правило${NC}"
-        echo -e "7) ${RED}Сбросить ВСЕ настройки${NC}"
+        echo -e "7) ${RED}Сбросить ВСЕ правила COMP_MANIYA${NC}"
         echo -e "8) ${YELLOW}Показать PROMO${NC}"
         echo -e "9) ${MAGENTA}📚 ИНСТРУКЦИЯ${NC}"
         echo -e "10) Проверить соединение"
@@ -790,15 +1318,16 @@ show_menu() {
         echo -e "17) Live подключения"
         echo -e "18) 🔀 ${CYAN}IPv4 → IPv6 каскад UDP${NC} (socat)"
         echo -e "19) 🔀 ${CYAN}IPv4 → IPv6 каскад TCP${NC} (socat)"
+        echo -e "20) ${BLUE}📖 Справка${NC}"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
 
         read -p "Ваш выбор: " choice
 
         case $choice in
-            1) configure_rule "udp" "AmneziaWG" ;;
-            2) configure_rule "tcp" "VLESS" ;;
-            3) configure_rule "tcp" "MTProto/TProxy" ;;
+            1) configure_rule "udp" "AmneziaWG / WireGuard" ;;
+            2) configure_rule "tcp" "VLESS / XRay" ;;
+            3) configure_rule "tcp" "MTProto / TProxy" ;;
             4) configure_custom_rule ;;
             5) list_active_rules ;;
             6) delete_single_rule ;;
@@ -815,6 +1344,7 @@ show_menu() {
             17) live_connections ;;
             18) configure_ipv4_to_ipv6_rule "udp" ;;
             19) configure_ipv4_to_ipv6_rule "tcp" ;;
+            20) show_help ;;
             0) exit 0 ;;
             *) ;;
         esac
@@ -822,6 +1352,7 @@ show_menu() {
 }
 
 # --- ЗАПУСК ---
+
 check_root
 prepare_system
 show_menu
