@@ -1432,7 +1432,7 @@ port_traffic_stats() {
     done
 
     # IPv6 из socat сервисов
-    for svc_file in /etc/systemd/system/socat-ipv6-*.service 2>/dev/null; do
+    for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
         if [[ ! -f "$svc_file" ]]; then
             continue
         fi
