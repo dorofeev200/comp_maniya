@@ -1096,72 +1096,105 @@ EOF
 
 # --- ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES (БЕЗОПАСНО) ---
 
+# Функция отката транзакции
+execute_rollback() {
+    local -a commands=("$@")
+    log_warn "⚠️  Выполнение отката транзакции..."
+    
+    for cmd in "${commands[@]}"; do
+        log_debug "Откат: $cmd"
+        eval "$cmd" 2>/dev/null || true
+    done
+    
+    log_error "Откат выполнен, правило не применено"
+}
+
 apply_iptables_rules() {
-    local PROTO=$1
-    local IN_PORT=$2
-    local OUT_PORT=$3
-    local TARGET_IP=$4
-    local NAME=$5
-
-    IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk -- '{printf $5}' | head -1)
-    if [[ -z "$IFACE" ]]; then
-        echo -e "${RED}[ERROR] Не удалось определить интерфейс!${NC}"
+    local proto=$1 in_port=$2 out_port=$3 target_ip=$4 name=$5
+    local uuid=$(generate_uuid)
+    local marker="COMP_MANIYA:v3:$uuid"
+    
+    log_info "Применение правила: $name"
+    log_info "  $proto: $in_port → $target_ip:$out_port"
+    
+    # Определение исходящего интерфейса
+    local iface=$(ip route get "$target_ip" 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    if [[ -z "$iface" ]]; then
+        log_error "Не удалось определить маршрут к $target_ip"
         return 1
     fi
-
-    echo -e "${YELLOW}[*] Применение правил...${NC}"
-
-    # Удаление старых правил (если они были)
-    iptables -t nat -D CM_DNAT_RULES -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null || true
-    iptables -D CM_INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null || true
-    iptables -D CM_FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    iptables -D CM_FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-
-    # Новые правила в CM_* цепочках
-    if ! iptables -A CM_INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT; then
-        echo -e "${RED}[ERROR] Ошибка добавления INPUT правила${NC}"
+    log_debug "Исходящий интерфейс: $iface"
+    
+    # === ТРАНЗАКЦИЯ НАЧАЛО ===
+    local -a rollback_commands=()
+    
+    # 1. INPUT правило
+    if ! iptables -A CM_INPUT -p "$proto" --dport "$in_port" \
+        -m comment --comment "$marker:input" -j ACCEPT; then
+        log_error "Ошибка: CM_INPUT"
+        return 1
+    fi
+    rollback_commands+=("iptables -D CM_INPUT -p '$proto' --dport '$in_port' -m comment --comment '$marker:input' -j ACCEPT")
+    
+    # 2. DNAT правило
+    if ! iptables -t nat -A CM_DNAT_RULES -p "$proto" --dport "$in_port" \
+        -m comment --comment "$marker:dnat" \
+        -j DNAT --to-destination "$target_ip:$out_port"; then
+        log_error "Ошибка: CM_DNAT_RULES"
+        execute_rollback "${rollback_commands[@]}"
+        return 1
+    fi
+    rollback_commands+=("iptables -t nat -D CM_DNAT_RULES -p '$proto' --dport '$in_port' -m comment --comment '$marker:dnat' -j DNAT --to-destination '$target_ip:$out_port'")
+    
+    # 3. FORWARD входящее
+    if ! iptables -A CM_FORWARD -p "$proto" -d "$target_ip" --dport "$out_port" \
+        -m state --state NEW,ESTABLISHED,RELATED \
+        -m comment --comment "$marker:fwd:in" -j ACCEPT; then
+        log_error "Ошибка: CM_FORWARD (входящее)"
+        execute_rollback "${rollback_commands[@]}"
+        return 1
+    fi
+    rollback_commands+=("iptables -D CM_FORWARD -p '$proto' -d '$target_ip' --dport '$out_port' -m state --state NEW,ESTABLISHED,RELATED -m comment --comment '$marker:fwd:in' -j ACCEPT")
+    
+    # 4. FORWARD исходящее
+    if ! iptables -A CM_FORWARD -p "$proto" -s "$target_ip" --sport "$out_port" \
+        -m state --state ESTABLISHED,RELATED \
+        -m comment --comment "$marker:fwd:out" -j ACCEPT; then
+        log_error "Ошибка: CM_FORWARD (исходящее)"
+        execute_rollback "${rollback_commands[@]}"
+        return 1
+    fi
+    rollback_commands+=("iptables -D CM_FORWARD -p '$proto' -s '$target_ip' --sport '$out_port' -m state --state ESTABLISHED,RELATED -m comment --comment '$marker:fwd:out' -j ACCEPT")
+    
+    # 5. MASQUERADE для интерфейса (ИСПРАВЛЕНО в v3.0)
+    if ! ensure_masquerade_for_interface "$iface"; then
+        log_error "Ошибка: MASQUERADE"
+        execute_rollback "${rollback_commands[@]}"
         return 1
     fi
     
-    if ! iptables -t nat -A CM_DNAT_RULES -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"; then
-        echo -e "${RED}[ERROR] Ошибка добавления DNAT правила${NC}"
-        return 1
+    # 6. UFW (опционально)
+    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+        ufw allow "$in_port/$proto" comment "$marker" >/dev/null 2>&1 || {
+            log_warn "UFW: не удалось добавить правило"
+        }
     fi
     
-    # MASQUERADE только для целевого IP (в CM_SNAT_RULES)
-    if ! iptables -t nat -C CM_SNAT_RULES -d "$TARGET_IP" -o "$IFACE" -j MASQUERADE 2>/dev/null; then
-        if ! iptables -t nat -A CM_SNAT_RULES -d "$TARGET_IP" -o "$IFACE" -j MASQUERADE; then
-            echo -e "${RED}[ERROR] Ошибка добавления SNAT правила${NC}"
-            return 1
-        fi
-    fi
-
-    if ! iptables -A CM_FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT; then
-        echo -e "${RED}[ERROR] Ошибка добавления FORWARD правила (в)${NC}"
-        return 1
+    # === ТРАНЗАКЦИЯ COMMIT ===
+    if ! netfilter-persistent save >/dev/null 2>&1; then
+        log_warn "netfilter-persistent save: ошибка"
     fi
     
-    if ! iptables -A CM_FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT; then
-        echo -e "${RED}[ERROR] Ошибка добавления FORWARD правила (из)${NC}"
-        return 1
-    fi
-
-    # UFW: добавить правило если активен (НЕ меняем DEFAULT_FORWARD_POLICY!)
-    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$IN_PORT"/"$PROTO" >/dev/null 2>&1 || true
-    fi
-
-    # Сохранение конфигурации
-    if ! netfilter-persistent save > /dev/null 2>&1; then
-        echo -e "${YELLOW}[!] Предупреждение: netfilter-persistent save не сработал${NC}"
-    fi
+    # Сохранение метаданных v3
+    save_rule_metadata_v3 "$proto" "$in_port" "$out_port" "$target_ip" "$name" "$uuid"
     
-    # Сохранение метаданных о правиле
-    save_rule_metadata "$PROTO" "$IN_PORT" "$OUT_PORT" "$TARGET_IP" "$NAME"
-    
-    echo -e "${GREEN}[SUCCESS] $NAME настроен!${NC}"
-    echo -e "$PROTO: Вход $IN_PORT -> Выход $TARGET_IP:$OUT_PORT"
+    log_success "✓ Правило применено успешно"
+    log_info "  UUID: $uuid"
+    echo -e "${GREEN}[SUCCESS] $name настроен!${NC}"
+    echo -e "$proto: Вход $in_port -> Выход $target_ip:$out_port"
     read -p "Нажмите Enter для возврата в меню..."
+    
+    return 0
 }
 
 # --- СПИСОК ПРАВИЛ ---
@@ -1405,141 +1438,259 @@ check_connection() {
 
 # --- BACKUP ---
 
-backup_rules() {
-    echo -e "${CYAN}--- Создание backup ---${NC}"
-
-    local backup_file="$BACKUP_DIR/compmaniya-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-    local temp_backup="/tmp/compmaniya-backup-$$"
-    mkdir -p "$temp_backup"
-
-    # Сохранить только CM_* iptables цепочки
+backup_rules_v3() {
+    local backup_name="${1:-$(date +%Y%m%d-%H%M%S)}"
+    local backup_file="$BACKUP_DIR/compmaniya-backup-${backup_name}.tar.gz"
+    local temp_dir=$(mktemp -d)
+    
+    log_info "Создание backup: $backup_name"
+    
+    # Сохранение iptables в правильном формате для iptables-restore
     {
-        echo "# COMP_MANIYA Backup - $(date)"
-        echo "# Содержит только CM_* цепочки"
-        iptables-save | grep -E "^:(CM_|PREROUTING|POSTROUTING|FORWARD|INPUT)" 
-        iptables-save | grep -E "^\[.*\]\s+-A\s+(CM_|PREROUTING.*CM|POSTROUTING.*CM|FORWARD.*CM|INPUT.*CM)"
-    } > "$temp_backup/iptables.rules"
-
-    # Сохранить метаданные правил
-    [[ -f "$CM_RULES_FILE" ]] && cp "$CM_RULES_FILE" "$temp_backup/rules.metadata"
-
-    # Сохранить конфиги socat
-    for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
-        [[ -f "$svc_file" ]] && cp "$svc_file" "$temp_backup/"
-    done
-
-    # Архивировать
-    tar czf "$backup_file" -C "$temp_backup" . 2>/dev/null
-    rm -rf "$temp_backup"
-
-    echo -e "${GREEN}[OK] Backup сохранён:${NC}"
-    echo "$backup_file"
-    ls -lh "$backup_file"
-
+        echo "# COMP_MANIYA v3.0 Backup"
+        echo "# Created: $(date -R)"
+        echo "# Hostname: $(hostname)"
+        echo ""
+        
+        # NAT таблица
+        echo "*nat"
+        iptables-save -t nat | awk '
+            /^:CM_/ { print; next }
+            /^-A CM_/ { print; next }
+            /^-A PREROUTING.*-j CM_DNAT_RULES/ { print; next }
+            /^-A POSTROUTING.*-j CM_SNAT_RULES/ { print; next }
+        '
+        echo "COMMIT"
+        echo ""
+        
+        # FILTER таблица
+        echo "*filter"
+        iptables-save -t filter | awk '
+            /^:CM_/ { print; next }
+            /^-A CM_/ { print; next }
+            /^-A INPUT.*-j CM_INPUT/ { print; next }
+            /^-A FORWARD.*-j CM_FORWARD/ { print; next }
+        '
+        echo "COMMIT"
+        
+    } > "$temp_dir/iptables.rules"
+    
+    # Метаданные
+    [[ -f "$CM_RULES_FILE" ]] && cp "$CM_RULES_FILE" "$temp_dir/rules.metadata"
+    
+    # Socat конфигурации
+    cp /etc/systemd/system/socat-ipv6-*.service "$temp_dir/" 2>/dev/null || true
+    
+    # Версия и метаинфо
+    cat > "$temp_dir/backup_info.txt" <<EOF
+VERSION=3.0
+BACKUP_DATE=$(date +%s)
+BACKUP_NAME=$backup_name
+HOSTNAME=$(hostname)
+KERNEL=$(uname -r)
+EOF
+    
+    # Контрольные суммы
+    (cd "$temp_dir" && sha256sum * 2>/dev/null > manifest.sha256)
+    
+    # Архивирование
+    if ! tar czf "$backup_file" -C "$temp_dir" . 2>/dev/null; then
+        rm -rf "$temp_dir"
+        log_error "Ошибка создания архива"
+        return 1
+    fi
+    
+    rm -rf "$temp_dir"
+    
+    log_success "Backup создан: $backup_file"
+    log_info "Размер: $(du -h "$backup_file" | cut -f1)"
+    
+    echo -e "${GREEN}[OK] Backup сохранён${NC}"
     read -p "Нажмите Enter..."
+    return 0
+}
+
+# Алиас для совместимости
+backup_rules() {
+    backup_rules_v3 "$@"
 }
 
 # --- RESTORE ---
 
-restore_rules() {
-    echo -e "${CYAN}--- Восстановление backup ---${NC}"
-
-    # Найти последний backup
-    local latest_backup=$(ls -t "$BACKUP_DIR"/compmaniya-backup-*.tar.gz 2>/dev/null | head -1)
+restore_rules_v3() {
+    local backup_file="${1:-}"
     
-    if [[ -z "$latest_backup" ]]; then
-        echo -e "${RED}[ERROR] Backup не найден!${NC}"
+    # Если не указан, берём последний
+    if [[ -z "$backup_file" ]]; then
+        backup_file=$(find "$BACKUP_DIR" -name "compmaniya-backup-*.tar.gz" -type f \
+            -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)
+    fi
+    
+    if [[ ! -f "$backup_file" ]]; then
+        log_error "Backup не найден"
         read -p "Нажмите Enter..."
         return 1
     fi
-
-    echo -e "Найден backup: ${GREEN}$(basename "$latest_backup")${NC}"
-    read -p "Восстановить из этого backup? (y/n): " confirm
-    [[ "$confirm" != "y" ]] && return
-
-    local temp_restore="/tmp/compmaniya-restore-$$"
-    mkdir -p "$temp_restore"
-
-    # Распаковать
-    tar xzf "$latest_backup" -C "$temp_restore"
-
-    echo -e "${YELLOW}[*] Восстановление CM_* цепочек...${NC}"
     
-    # Восстановить только наши цепочки (не перезаписывать всё)
-    if [[ -f "$temp_restore/iptables.rules" ]]; then
-        grep -E "^:\s*CM_" "$temp_restore/iptables.rules" | while read -r line; do
-            eval "$line" 2>/dev/null || true
-        done
+    log_info "Восстановление из: $(basename "$backup_file")"
+    echo -e "${YELLOW}Текущие правила будут заменены!${NC}"
+    read -p "Продолжить? (y/n): " confirm
+    [[ "$confirm" != "y" ]] && return 0
+    
+    local temp_dir=$(mktemp -d)
+    trap "rm -rf '$temp_dir'" RETURN
+    
+    # Распаковка
+    if ! tar xzf "$backup_file" -C "$temp_dir" 2>/dev/null; then
+        log_error "Ошибка распаковки backup"
+        return 1
+    fi
+    
+    # Проверка целостности
+    if [[ -f "$temp_dir/manifest.sha256" ]]; then
+        if ! (cd "$temp_dir" && sha256sum -c manifest.sha256 --quiet 2>/dev/null); then
+            log_error "Backup повреждён! Контрольная сумма не совпадает."
+            return 1
+        fi
+        log_success "Проверка целостности: OK"
+    fi
+    
+    # Safety backup текущего состояния
+    log_info "Создание safety backup..."
+    backup_rules_v3 "pre-restore-$(date +%Y%m%d-%H%M%S)" || {
+        log_error "Не удалось создать safety backup"
+        return 1
+    }
+    
+    # Очистка текущих CM_* правил
+    log_info "Очистка текущих правил..."
+    iptables -F CM_INPUT 2>/dev/null || true
+    iptables -F CM_FORWARD 2>/dev/null || true
+    iptables -t nat -F CM_DNAT_RULES 2>/dev/null || true
+    iptables -t nat -F CM_SNAT_RULES 2>/dev/null || true
+    
+    # Восстановление через iptables-restore (БЕЗ EVAL!)
+    if [[ -f "$temp_dir/iptables.rules" ]]; then
+        log_info "Восстановление iptables правил..."
         
-        grep -E "^\[.*\]\s+-A\s+CM_" "$temp_restore/iptables.rules" | while read -r line; do
-            eval "$line" 2>/dev/null || true
+        if ! iptables-restore --noflush < "$temp_dir/iptables.rules" 2>/tmp/restore_error.log; then
+            log_error "Ошибка восстановления iptables:"
+            cat /tmp/restore_error.log
+            log_warn "Используйте safety backup для отката"
+            return 1
+        fi
+        log_success "Правила iptables восстановлены"
+    fi
+    
+    # Восстановление socat сервисов
+    if ls "$temp_dir"/socat-ipv6-*.service &>/dev/null; then
+        log_info "Восстановление socat сервисов..."
+        for svc in "$temp_dir"/socat-ipv6-*.service; do
+            local svc_name=$(basename "$svc")
+            cp "$svc" "/etc/systemd/system/$svc_name"
+            systemctl daemon-reload
+            systemctl enable "$svc_name" >/dev/null 2>&1
+            systemctl restart "$svc_name"
+            log_success "  ✓ $svc_name"
         done
     fi
-
-    # Восстановить socat сервисы
-    for svc_file in "$temp_restore"/socat-ipv6-*.service; do
-        [[ -f "$svc_file" ]] || continue
-        local svc_name=$(basename "$svc_file")
-        cp "$svc_file" "/etc/systemd/system/$svc_name"
-        systemctl daemon-reload
-        systemctl enable "$svc_name" >/dev/null 2>&1
-        systemctl restart "$svc_name"
-        echo -e "${GREEN}[OK] Восстановлен: $svc_name${NC}"
-    done
-
-    # Восстановить метаданные
-    [[ -f "$temp_restore/rules.metadata" ]] && cp "$temp_restore/rules.metadata" "$CM_RULES_FILE"
-
-    netfilter-persistent save > /dev/null 2>&1 || true
-    rm -rf "$temp_restore"
     
-    echo -e "${GREEN}[OK] Правила восстановлены (только CM_* цепочки).${NC}"
+    # Восстановление метаданных
+    if [[ -f "$temp_dir/rules.metadata" ]]; then
+        cp "$temp_dir/rules.metadata" "$CM_RULES_FILE"
+        log_success "Метаданные восстановлены"
+    fi
+    
+    netfilter-persistent save >/dev/null 2>&1 || true
+    
+    log_success "Restore завершён успешно"
     read -p "Нажмите Enter..."
+    return 0
+}
+
+# Алиас для совместимости
+restore_rules() {
+    restore_rules_v3 "$@"
 }
 
 # --- ПОЛНОЕ УДАЛЕНИЕ ---
 
 uninstall_script() {
-    echo -e "${RED}╔══════════════════════════════════════╗${NC}"
-    echo -e "${RED}║      ПОЛНОЕ УДАЛЕНИЕ СКРИПТА         ║${NC}"
-    echo -e "${RED}╚══════════════════════════════════════╝${NC}"
-    echo ""
+    clear
+    cat <<'EOF'
+╔══════════════════════════════════════════════════════════╗
+║          ПОЛНОЕ УДАЛЕНИЕ COMP_MANIYA v3.0                ║
+╚══════════════════════════════════════════════════════════╝
 
-    echo "Будет удалено:"
-    echo "- все правила CM_* iptables"
-    echo "- все IPv4→IPv6 правила (socat сервисы)"
-    echo "- backup файлы"
-    echo "- launcher команда compmaniya"
-    echo ""
-    echo "Сохранено:"
-    echo "- UFW правила"
-    echo "- Docker правила"
-    echo "- Fail2ban правила"
-    echo "- Все остальные iptables правила"
-    echo ""
+⚠️  ВНИМАНИЕ: Будет удалено:
+  • Все правила iptables COMP_MANIYA
+  • Все socat сервисы (IPv4→IPv6)
+  • UFW правила (созданные скриптом)
+  • Системные файлы и конфигурация
 
-    read -p "Введите YES для подтверждения: " confirm
-    confirm=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
+✅ НЕ затрагивается:
+  • Правила UFW/Docker/Fail2ban
+  • Другие iptables правила
+  • Настройки сети
 
-    if [[ "$confirm" != "yes" && "$confirm" != "y" ]]; then
-        echo -e "${YELLOW}Удаление отменено.${NC}"
-        read -p "Нажмите Enter..."
-        return
-    fi
+EOF
 
-    echo -e "${YELLOW}[*] Остановка IPv4→IPv6 сервисов...${NC}"
-
-    for svc_file in /etc/systemd/system/socat-ipv6-*.service; do
-        [[ -f "$svc_file" ]] || continue
-        local svc_name=$(basename "$svc_file" .service)
+    read -p "Введите 'YES' для подтверждения: " confirm
+    [[ "$(echo "$confirm" | tr '[:upper:]' '[:lower:]')" != "yes" ]] && {
+        log_info "Удаление отменено"
+        return 0
+    }
+    
+    # Финальный backup
+    log_warn "Создание финального backup..."
+    backup_rules_v3 "pre-uninstall-$(date +%Y%m%d-%H%M%S)" || true
+    
+    # Шаг 1/7: Socat сервисы
+    log_info "[1/7] Остановка socat сервисов..."
+    for svc in /etc/systemd/system/socat-ipv6-*.service; do
+        [[ ! -f "$svc" ]] && continue
+        local svc_name=$(basename "$svc" .service)
         systemctl stop "$svc_name" 2>/dev/null || true
-        systemctl disable "$svc_name" > /dev/null 2>&1 || true
-        rm -f "$svc_file"
+        systemctl disable "$svc_name" 2>/dev/null || true
+        rm -f "$svc"
+        log_info "  ✓ $svc_name удалён"
     done
     systemctl daemon-reload
-
-    echo -e "${YELLOW}[*] Удаление CM_* iptables цепочек...${NC}"
-
+    
+    # Шаг 2/7: UFW правила
+    log_info "[2/7] Удаление UFW правил..."
+    if command -v ufw &>/dev/null && [[ -f "$CM_RULES_FILE" ]]; then
+        while IFS='|' read -r proto in_port _ _ _ _ _; do
+            [[ -z "$proto" ]] && continue
+            ufw delete allow "$in_port/$proto" 2>/dev/null || true
+        done < "$CM_RULES_FILE"
+    fi
+    
+    # Шаг 3/7: Удаление маркированных правил
+    log_info "[3/7] Удаление маркированных правил..."
+    for table in nat filter; do
+        local chains=$(iptables -t "$table" -S 2>/dev/null | grep "COMP_MANIYA:v3" | \
+            sed 's/^-A //' | awk '{print $1}' | sort -u)
+        
+        for chain in $chains; do
+            local rules=$(iptables -t "$table" -S "$chain" 2>/dev/null | \
+                grep -n "COMP_MANIYA:v3" | cut -d: -f1 | sort -rn)
+            
+            for rule_num in $rules; do
+                iptables -t "$table" -D "$chain" "$rule_num" 2>/dev/null || true
+            done
+        done
+    done
+    
+    # Шаг 4/7: Удаление jump правил (КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v3.0)
+    log_info "[4/7] Удаление переходов к CM_* цепочкам..."
+    iptables -D INPUT -j CM_INPUT 2>/dev/null || true
+    iptables -D FORWARD -j CM_FORWARD 2>/dev/null || true
+    iptables -t nat -D PREROUTING -j CM_DNAT_RULES 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -j CM_SNAT_RULES 2>/dev/null || true
+    
+    # Шаг 5/7: Удаление CM_* цепочек
+    log_info "[5/7] Удаление CM_* цепочек..."
     iptables -F CM_INPUT 2>/dev/null || true
     iptables -F CM_FORWARD 2>/dev/null || true
     iptables -t nat -F CM_DNAT_RULES 2>/dev/null || true
@@ -1549,23 +1700,46 @@ uninstall_script() {
     iptables -X CM_FORWARD 2>/dev/null || true
     iptables -t nat -X CM_DNAT_RULES 2>/dev/null || true
     iptables -t nat -X CM_SNAT_RULES 2>/dev/null || true
-
-    netfilter-persistent save > /dev/null 2>&1 || true
-
-    echo -e "${YELLOW}[*] Удаление файлов...${NC}"
-
+    
+    # Шаг 6/7: sysctl конфигурация
+    log_info "[6/7] Удаление sysctl конфигурации..."
+    if [[ -f "/etc/sysctl.d/90-comp-maniya.conf" ]]; then
+        rm -f "/etc/sysctl.d/90-comp-maniya.conf"
+        sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+    fi
+    
+    # Шаг 7/7: Файлы
+    log_info "[7/7] Удаление файлов..."
     rm -f /usr/local/bin/compmaniya
-    rm -f "$BACKUP_DIR"/compmaniya-backup*.rules
-    rm -f "$BACKUP_DIR"/compmaniya-backup*.tar.gz
-    rm -f "$BACKUP_DIR"/compmaniya-backup-ipv6.list
-    rm -f "$CM_RULES_FILE"
     rm -rf "$CM_STATE_DIR"
-
+    rm -f "$CM_RULES_FILE"
+    rm -rf "/var/log/comp_maniya"
+    
+    # Backup файлы (опционально)
+    local backup_count=$(find "$BACKUP_DIR" -name "compmaniya-backup-*.tar.gz" 2>/dev/null | wc -l)
+    if [[ $backup_count -gt 0 ]]; then
+        echo ""
+        log_info "Найдено $backup_count backup файлов"
+        read -p "Удалить все backup файлы? (y/n): " del_backups
+        if [[ "$del_backups" == "y" ]]; then
+            rm -f "$BACKUP_DIR"/compmaniya-backup-*.tar.gz
+            log_success "Backup файлы удалены"
+        else
+            log_info "Backup файлы сохранены в $BACKUP_DIR"
+        fi
+    fi
+    
+    # Финальное сохранение
+    netfilter-persistent save >/dev/null 2>&1 || true
+    
     echo ""
-    echo -e "${GREEN}[SUCCESS] Скрипт полностью удалён.${NC}"
-    echo -e "${GREEN}[SUCCESS] Правила UFW/Docker/Fail2ban сохранены.${NC}"
-    echo -e "${CYAN}[i] Перезапустите терминал для завершения.${NC}"
-
+    log_success "════════════════════════════════════════════════"
+    log_success "  COMP_MANIYA v3.0 полностью удалён"
+    log_success "════════════════════════════════════════════════"
+    log_info "• Правила UFW/Docker/Fail2ban сохранены"
+    log_info "• Система возвращена в исходное состояние"
+    echo ""
+    
     exit 0
 }
 
